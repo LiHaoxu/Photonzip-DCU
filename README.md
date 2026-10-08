@@ -198,11 +198,23 @@ and pass it to `photonzip.decompress(...)`.
 
 ### Delta preprocessing
 
-`apply_delta` stores slice 0 as-is (bit-cast to int16) and every following
-slice as `clip(x[i] - x[i-1], -32768, 32767)`, returned as a uint16 bit-view.
-The result is lossless iff no difference overflows int16; the returned metadata
-reports `overflow_pixels` and `lossless`. `invert_delta` restores the volume
-with a cumulative sum modulo 2^16.
+`apply_delta(array, encoding="int16")` stores slice 0 as-is and every following
+slice as `clip(x[i] - x[i-1], -32768, 32767)` in a uint16 array. The result is
+lossless iff no difference overflows int16; the returned metadata reports
+`overflow_pixels`, `lossless` and the `encoding`. `invert_delta` restores the
+volume with a running sum modulo 2^16 (metadata without `encoding` means `int16`).
+
+| `encoding` | stored value | use with |
+|---|---|---|
+| `int16` (default) | two's complement bit pattern (-1 -> 65535) | LC |
+| `offset` | difference + 32768 (-1 -> 32767) | MANS |
+
+MANS needs `offset`: its ADM only maps blocks whose `max - min` is below 3500 and
+codes `|value - center|`, so with `int16` any block holding both positive and
+negative differences spans ~65535 and is stored raw. On a 100 x 2048 x 2048
+tomography stack, `int16` left 2% of the blocks to ADM and MANS (ratio 1.254) did
+worse than plain ANS on the same bytes (1.473); with `offset` 99.9% of the blocks
+use ADM and MANS reaches 1.479. The CLI picks `offset` for `--codec mans`.
 
 ## CLI
 
@@ -232,9 +244,9 @@ Compression levels select the codec and are kept for codecs added later:
 
 `--dims` is the C-order shape (slowest dimension first, 1 to 3 values). Legacy
 aliases `--level`/`--fidelity`, `--speed` and `--ratio` are accepted. Invalid
-arguments exit with status 2, runtime errors with status 1. `--delta` with MANS
-prints a warning: the signed differences are stored as uint16 bit patterns, which
-defeats MANS's range test (e.g. ratio 1.96 -> 1.42 on a volume chunk).
+arguments exit with status 2, runtime errors with status 1. `--delta` stores the
+differences with the `offset` encoding for MANS and `int16` for LC (see "Delta
+preprocessing").
 
 The `.pzc` container is `b"PZC1"`, a little-endian uint64 metadata length,
 UTF-8 JSON metadata (`codec`, `backend`, `dtype`, `shape`, `codec_params`,
