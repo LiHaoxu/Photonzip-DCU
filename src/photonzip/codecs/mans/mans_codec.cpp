@@ -29,7 +29,10 @@ void ensure_dcu_backend(const CodecOptions& options) {
   }
 }
 
-// Geometry follows the upstream H5Z-MANS convention: nx/ny/nz are shape[0..2].
+// MANS indexes elements as x + y * nx + z * nx * ny, so nx must be the fastest-varying
+// dimension. PhotonZip tensors are C-contiguous, so that is the last axis: nx = shape[-1],
+// ny = shape[-2], nz = shape[-3]. (Passing shape[0] as nx transposes the ADM tiles; it stays
+// lossless but costs ratio, e.g. 1.96 -> 1.48 on an 8x512x512 volume chunk.)
 mans::MansParams to_mans_params(const CodecOptions& options, std::size_t element_count) {
   if (options.shape.empty() || options.shape.size() > 3) {
     throw std::runtime_error("MANS requires a tensor with 1 to 3 dimensions.");
@@ -49,10 +52,11 @@ mans::MansParams to_mans_params(const CodecOptions& options, std::size_t element
   params.backend = mans::Backend::DCU;
   params.dtype = options.dtype == DataType::kUInt32 ? mans::DataType::U32 : mans::DataType::U16;
   params.mode = mans::Mode::P;  // the DCU backend implements P-mode only
-  params.dims = static_cast<std::uint32_t>(options.shape.size());
-  params.nx = options.shape[0];
-  params.ny = options.shape.size() >= 2 ? options.shape[1] : 0;
-  params.nz = options.shape.size() >= 3 ? options.shape[2] : 0;
+  const std::size_t rank = options.shape.size();
+  params.dims = static_cast<std::uint32_t>(rank);
+  params.nx = options.shape[rank - 1];
+  params.ny = rank >= 2 ? options.shape[rank - 2] : 0;
+  params.nz = rank >= 3 ? options.shape[rank - 3] : 0;
   return params;
 }
 
