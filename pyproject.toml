@@ -5,7 +5,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "photonzip"
 version = "0.1.0"
-description = "PhotonZip LC: lossless CPU compression for uint16 detector data"
+description = "PhotonZip: lossless LC (CPU/DCU) and MANS (DCU) compression for detector data"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
