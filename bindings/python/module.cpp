@@ -473,7 +473,13 @@ PhotonZipArray compress_tensor(const std::string& codec_name,
       make_tensor_options(codec_name, backend, dl_tensor, std::move(codec_params));
   const auto& codec = get_codec(codec_name);
   const auto input_buffer = make_input_buffer(dl_tensor);
-  const auto output = codec.compress(input_buffer, options);
+  Buffer output;
+  {
+    // The codec only touches raw buffers, so other Python threads (e.g. a thread pool feeding
+    // several chunks to the DCU) can run meanwhile.
+    py::gil_scoped_release release;
+    output = codec.compress(input_buffer, options);
+  }
   return PhotonZipArray(make_compressed_state(codec_name, options, output));
 }
 
@@ -498,7 +504,11 @@ PhotonZipArray decompress_tensor(const PhotonZipArray& input,
   input_buffer.memory_kind = input.state().buffer.memory_kind;
 
   const auto& codec = get_codec(input.state().codec_name);
-  const auto output = codec.decompress(input_buffer, options);
+  Buffer output;
+  {
+    py::gil_scoped_release release;
+    output = codec.decompress(input_buffer, options);
+  }
   return PhotonZipArray(make_uncompressed_state(input, output));
 }
 
