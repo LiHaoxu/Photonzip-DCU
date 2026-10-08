@@ -14,6 +14,9 @@
 #include "photonzip/core/codec_registry.hpp"
 #include "photonzip/core/codec_types.hpp"
 #include "photonzip/core/errors.hpp"
+#ifdef PHOTONZIP_ENABLE_DCU
+#include "photonzip/core/dcu_runtime.hpp"
+#endif
 
 namespace py = pybind11;
 
@@ -134,6 +137,9 @@ Backend parse_backend(const std::string& value, Backend inferred_backend) {
   if (value == "cuda") {
     return Backend::kCuda;
   }
+  if (value == "dcu") {
+    return Backend::kDcu;
+  }
   throw Error("Unsupported backend: " + value);
 }
 
@@ -163,7 +169,11 @@ MemoryKind parse_memory_kind(const DLDevice& device) {
   if (device.device_type == kDLCUDA) {
     return MemoryKind::kCuda;
   }
-  throw Error("Only CPU and CUDA DLPack tensors are supported.");
+  if (device.device_type == kDLROCM) {
+    // HIP device memory: PyTorch/CuPy on a DCU export their tensors as kDLROCM.
+    return MemoryKind::kDcu;
+  }
+  throw Error("Only CPU, CUDA and ROCm/DCU DLPack tensors are supported.");
 }
 
 std::size_t checked_product(std::size_t lhs, std::size_t rhs, const char* what) {
@@ -215,7 +225,12 @@ CodecOptions make_tensor_options(const std::string& codec_name,
                                  const DLTensor& tensor,
                                  std::vector<std::uint32_t> codec_params) {
   const MemoryKind memory_kind = parse_memory_kind(tensor.device);
-  const Backend inferred_backend = memory_kind == MemoryKind::kCuda ? Backend::kCuda : Backend::kCpu;
+  Backend inferred_backend = Backend::kCpu;
+  if (memory_kind == MemoryKind::kCuda) {
+    inferred_backend = Backend::kCuda;
+  } else if (memory_kind == MemoryKind::kDcu) {
+    inferred_backend = Backend::kDcu;
+  }
 
   CodecOptions options;
   options.backend = parse_backend(backend, inferred_backend);
@@ -351,6 +366,9 @@ DLDevice to_dlpack_device(MemoryKind memory_kind) {
     case MemoryKind::kCuda:
       device.device_type = kDLCUDA;
       return device;
+    case MemoryKind::kDcu:
+      device.device_type = kDLROCM;
+      return device;
   }
   throw Error("Unsupported PhotonZip memory kind.");
 }
@@ -435,6 +453,13 @@ py::bytes buffer_to_py_bytes(const Buffer& buffer) {
   if (buffer.memory_kind == MemoryKind::kHost) {
     return py::bytes(reinterpret_cast<const char*>(buffer.bytes()), buffer.size);
   }
+#ifdef PHOTONZIP_ENABLE_DCU
+  if (buffer.memory_kind == MemoryKind::kDcu) {
+    std::string host(buffer.size, '\0');
+    dcu::copy_device_to_host(host.data(), buffer.bytes(), buffer.size);
+    return py::bytes(host);
+  }
+#endif
   throw Error("Unsupported buffer memory kind.");
 }
 

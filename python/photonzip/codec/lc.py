@@ -20,12 +20,16 @@ class LcOptions(CodecOptions):
     """Options for the LC codec.
 
     The LC codec uses a fixed component pipeline (``DIFFMS_2 BIT_2 RZE_2``) and is
-    lossless and CPU-only, so there are no tunable codec parameters. Global
+    lossless, so there are no tunable codec parameters. It runs on the ``"cpu"``
+    backend and, in DCU builds, on the ``"dcu"`` backend; both produce the same
+    bitstream, so data compressed on one decompresses on the other. Global
     preprocessing such as inter-slice delta (``photonzip.preprocess``) is applied
     by the caller before compression and is therefore not configured here.
 
     The matching HDF5 filter (``H5Z_FILTER_LC_ID``) takes no options either: the decoded
     size travels in the payload header, so ``compression_opts`` can be left out entirely.
+    In DCU builds the filter runs on the DCU; set ``PHOTONZIP_LC_BACKEND=cpu`` to force
+    the CPU.
     """
 
     @property
