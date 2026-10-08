@@ -83,7 +83,10 @@ if(PHOTONZIP_ENABLE_DCU)
     PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty
   )
-  target_compile_options(photonzip_dcu PRIVATE $<$<CONFIG:Release>:-O3>)
+  # Per-thread default streams: host threads sharing a DCU (or one thread per DCU) run their
+  # kernels and copies concurrently instead of serialising on the legacy null stream.
+  target_compile_options(photonzip_dcu PRIVATE $<$<CONFIG:Release>:-O3>
+    $<$<COMPILE_LANGUAGE:HIP>:-fgpu-default-stream=per-thread>)
   target_compile_definitions(photonzip_dcu PUBLIC PHOTONZIP_ENABLE_DCU)
   if(PHOTONZIP_DCU_ARCH)
     set_property(TARGET photonzip_dcu PROPERTY HIP_ARCHITECTURES "${PHOTONZIP_DCU_ARCH}")
@@ -132,6 +135,7 @@ if(PHOTONZIP_ENABLE_DCU)
   # Device-resident throughput benchmark (benchmarks/dcu_bench.cpp).
   add_executable(photonzip_dcu_bench benchmarks/dcu_bench.cpp)
   set_source_files_properties(benchmarks/dcu_bench.cpp PROPERTIES LANGUAGE HIP)
+  target_compile_options(photonzip_dcu_bench PRIVATE -fgpu-default-stream=per-thread)
   target_link_libraries(photonzip_dcu_bench PRIVATE photonzip_dcu)
   set_target_properties(photonzip_dcu_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
