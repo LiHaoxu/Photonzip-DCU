@@ -37,6 +37,7 @@ function(photonzip_add_filter target source)
     target_link_options(${target} PRIVATE -Wl,-Bsymbolic -Wl,-z,nodelete)
   endif()
   set_target_properties(${target} PROPERTIES
+    LINKER_LANGUAGE CXX  # link with the C++ driver even when HIP objects are linked in
     LIBRARY_OUTPUT_DIRECTORY ${PHOTONZIP_FILTER_PLUGIN_DIR}
     OUTPUT_NAME "${target}"
     PREFIX "lib"
