@@ -5,9 +5,14 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <string>
 
 #include "photonzip/codecs/lc/lc_pipeline.hpp"
 #include "photonzip_h5z_ids.h"
+
+#ifdef PHOTONZIP_ENABLE_DCU
+#include "photonzip/codecs/lc/lc_dcu.hpp"
+#endif
 
 // =========================================================
 // H5Z-LC: lossless LC pipeline DIFFMS_2 + BIT_2 + RZE_2
@@ -16,10 +21,37 @@
 // The pipeline components operate on 2-byte words, so the filter only accepts 16-bit
 // unsigned data. It takes no parameters: the decoded size travels in the payload header,
 // which makes the compressed chunks self-describing.
+//
+// When built with PHOTONZIP_ENABLE_DCU the chunks are (de)compressed on the DCU. The CPU and
+// DCU pipelines produce the same bitstream, so the backend is a runtime choice that does not
+// affect the file. PHOTONZIP_LC_BACKEND selects it: "dcu", "cpu" or "auto" (default: DCU when
+// a device is present, CPU otherwise).
 
 namespace {
 
 using photonzip::lc::byte;
+
+bool use_dcu() {
+#ifdef PHOTONZIP_ENABLE_DCU
+  static const bool enabled = []() {
+    const char* env = std::getenv("PHOTONZIP_LC_BACKEND");
+    const std::string choice = (env && env[0] != '\0') ? env : "auto";
+    if (choice == "cpu") {
+      return false;
+    }
+    const bool available = photonzip::lc::dcu::device_available();
+    if (choice == "dcu" && !available) {
+      std::cerr << "[H5Z-LC Warning] PHOTONZIP_LC_BACKEND=dcu but no DCU is available; using the CPU.\n";
+    } else if (choice != "dcu" && choice != "auto") {
+      std::cerr << "[H5Z-LC Warning] Unknown PHOTONZIP_LC_BACKEND=" << choice << "; using auto.\n";
+    }
+    return available;
+  }();
+  return enabled;
+#else
+  return false;
+#endif
+}
 
 htri_t H5Z_can_apply_lc(hid_t dcpl_id, hid_t type_id, hid_t space_id) {
   (void)dcpl_id;
@@ -72,7 +104,16 @@ size_t H5Z_filter_lc(unsigned int flags, size_t cd_nelmts, const unsigned int cd
       if (!dst_buf) {
         return 0;
       }
-      photonzip::lc::h_decode(static_cast<const byte*>(*buf), static_cast<byte*>(dst_buf), produced);
+#ifdef PHOTONZIP_ENABLE_DCU
+      if (use_dcu()) {
+        produced = photonzip::lc::dcu::decode_host(static_cast<const byte*>(*buf),
+                                                   static_cast<long long>(nbytes),
+                                                   static_cast<byte*>(dst_buf), decoded);
+      } else
+#endif
+      {
+        photonzip::lc::h_decode(static_cast<const byte*>(*buf), static_cast<byte*>(dst_buf), produced);
+      }
     } else {
       dst_capacity = static_cast<size_t>(
           photonzip::lc::max_encoded_size(static_cast<long long>(nbytes)));
@@ -80,8 +121,17 @@ size_t H5Z_filter_lc(unsigned int flags, size_t cd_nelmts, const unsigned int cd
       if (!dst_buf) {
         return 0;
       }
-      photonzip::lc::h_encode(static_cast<const byte*>(*buf), static_cast<long long>(nbytes),
-                              static_cast<byte*>(dst_buf), produced);
+#ifdef PHOTONZIP_ENABLE_DCU
+      if (use_dcu()) {
+        produced = photonzip::lc::dcu::encode_host(static_cast<const byte*>(*buf),
+                                                   static_cast<long long>(nbytes),
+                                                   static_cast<byte*>(dst_buf));
+      } else
+#endif
+      {
+        photonzip::lc::h_encode(static_cast<const byte*>(*buf), static_cast<long long>(nbytes),
+                                static_cast<byte*>(dst_buf), produced);
+      }
     }
 
     if (produced <= 0 || static_cast<size_t>(produced) > dst_capacity) {

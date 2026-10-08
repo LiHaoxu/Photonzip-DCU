@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
-# HDF5 filter plugin for the PhotonZip LC codec. The plugin is a standalone shared library
-# that HDF5 dlopens from HDF5_PLUGIN_PATH; the codec pipeline is header-only, so the plugin
-# does not link photonzip_core.
+# HDF5 filter plugins for the PhotonZip codecs. Each plugin is a standalone shared library
+# that HDF5 dlopens from HDF5_PLUGIN_PATH and does not link photonzip_core. The LC CPU
+# pipeline is header-only; with PHOTONZIP_ENABLE_DCU the plugins also link the HIP kernels
+# in photonzip_dcu (H5Z-LC gains a DCU path, H5Z-MANS is DCU-only).
 
 if(DEFINED HDF5_PREFER_PARALLEL)
   set(HDF5_PREFER_PARALLEL ${HDF5_PREFER_PARALLEL})
@@ -26,7 +27,7 @@ function(photonzip_add_filter target source)
   if(OpenMP_CXX_FOUND)
     target_link_libraries(${target} PRIVATE OpenMP::OpenMP_CXX)
   endif()
-  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT APPLE)
     # -Bsymbolic keeps the plugin's own symbols from being interposed by the host process,
     # which would otherwise be able to bind the LC pipeline to another loaded copy.
     #
@@ -43,3 +44,10 @@ function(photonzip_add_filter target source)
 endfunction()
 
 photonzip_add_filter(H5Z-LC src/H5Z-LC.cpp)
+
+if(PHOTONZIP_ENABLE_DCU)
+  target_link_libraries(H5Z-LC PRIVATE photonzip_dcu)
+
+  photonzip_add_filter(H5Z-MANS src/H5Z-MANS.cpp)
+  target_link_libraries(H5Z-MANS PRIVATE photonzip_dcu)
+endif()
