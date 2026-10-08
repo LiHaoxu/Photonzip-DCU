@@ -49,7 +49,7 @@ python/photonzip/          Python package (API, LC codec, preprocessing)
 filters/                   HDF5 filter plugins H5Z-LC and H5Z-MANS
 examples/photonzip_cli.py  command-line tool with the .pzc container format
 tests/test_dcu.py          DCU correctness checks (Python API, device tensors, HDF5)
-benchmarks/dcu_bench.cpp   device-resident DCU throughput benchmark
+benchmarks/dcu_bench.cpp   DCU throughput benchmark (device-resident, host chunks, multi-DCU)
 ```
 
 ## Install
@@ -87,7 +87,8 @@ cmake --build build -j
 # -> build/bin/plugins/libH5Z-LC.so, build/bin/plugins/libH5Z-MANS.so
 
 python3 tests/test_dcu.py --plugins build/bin/plugins
-build/bin/photonzip_dcu_bench data.u2 --dims 8192 1024   # needs a DCU
+build/bin/photonzip_dcu_bench data.u2 --dims 8192 1024   # needs a DCU; C-order shape
+build/bin/photonzip_dcu_bench data.u2 --dims 8192 1024 --chunk-rows 512 --parallel 2 4
 ```
 
 For the HDF5 filters, use a serial, shared HDF5 and make sure h5py links the
@@ -100,28 +101,61 @@ not found`), pass them via `PHOTONZIP_DCU_HIP_FLAGS`, e.g.
 
 ### DCU performance
 
-`photonzip_dcu_bench`, Hygon BW (gfx936), DTK 26.04, data already in device
-memory (no PCIe transfers), median of 5 runs. The Python API and the HDF5
-filters add host<->device copies and per-call setup on top of this.
+Hygon BW (gfx936, 80 CUs), DTK 26.04. All results verified against the input.
+
+**Device-resident** (`photonzip_dcu_bench`: data already in DCU memory, no PCIe
+transfers, median of 5 runs; shapes in C order):
 
 | Input | LC ratio | LC compress / decompress | MANS ratio | MANS compress / decompress |
 |---|---|---|---|---|
-| EXAFEL uint16, 16 MiB (8192x1024) | 1.831 | 57.9 / 55.6 GB/s | 1.681 | 0.99 / 5.89 GB/s |
-| smooth uint16, 2 MB (1D) | 5.151 | 21.1 / 21.0 GB/s | 2.065 | 0.45 / 4.25 GB/s |
-| uniform random uint16, 4 MB | 1.000 | 30.1 / 41.8 GB/s | 0.824 | 0.44 / 3.16 GB/s |
-| uint32, 2 MB (512x1000) | 1.450 | 21.6 / 20.9 GB/s | 2.665 | 0.46 / 4.17 GB/s |
+| EXAFEL uint16, 16 MiB (8192x1024) | 1.831 | 64.7 / 58.5 GB/s | 1.706 | 13.8 / 26.8 GB/s |
+| EXAFEL x64 uint16, 1 GiB (524288x1024) | 1.831 | 89.4 / 74.7 GB/s | 1.705 | 15.5 / 40.3 GB/s |
+| smooth volume uint16, 256 MiB (512^3) | 2.682 | 89.0 / 75.2 GB/s | 1.928 | 12.8 / 21.5 GB/s |
+| volume chunk uint16, 4 MiB (8x512x512) | 2.678 | 38.8 / 32.4 GB/s | 1.960 | 7.3 / 11.9 GB/s |
+| uniform random uint16, 4 MB | 1.000 | 44.7 / 63.6 GB/s | 0.824 | 7.5 / 14.2 GB/s |
+| uint32, 2 MB (512x1000) | 1.450 | 30.1 / 25.2 GB/s | 2.666 | 8.1 / 8.4 GB/s |
 
 The official LC GPU compressor for the same pipeline, built for gfx936, reaches
-56.1 GB/s (compress) on the EXAFEL input.
+56.9 GB/s (compress) on the 16 MiB EXAFEL input.
+
+**Host memory** (the path used by the Python API, the CLI and the HDF5 filters:
+copy in, compress, copy out). One call is bounded by PCIe and per-call setup
+(~2-4 GB/s), so throughput scales with concurrent calls. 1 GiB EXAFEL in 4 MiB
+chunks (`photonzip_dcu_bench --chunk-rows 4096 --parallel D T`):
+
+| DCUs x host threads | LC compress / decompress | MANS compress / decompress |
+|---|---|---|
+| 1 x 1 | 4.6 / 4.4 GB/s | 2.2 / 3.8 GB/s |
+| 1 x 4 | 12.7 / 12.8 GB/s | 6.3 / 12.3 GB/s |
+| 1 x 8 | 14.7 / 16.6 GB/s | 10.0 / 15.4 GB/s |
+| 4 x 4 | 16.9 / 16.3 GB/s | 14.2 / 15.7 GB/s |
+| 8 x 2 | 19.3 / 17.8 GB/s | 12.2 / 16.7 GB/s |
+
+Beyond ~16-19 GB/s the host side (pageable copies, memory bandwidth) is the
+limit. The Python bindings release the GIL during (de)compression, so a thread
+pool works too: 8 threads on one DCU reach 10.0 / 10.1 GB/s for MANS and
+7.9 / 10.7 GB/s for LC on the same data (vs. 2.6 / 2.5 and 2.8 / 2.8 GB/s with
+one thread). The first DCU call in a process also pays ~50 ms of runtime
+start-up; the CLI excludes it from its timings (see `--no-warmup`).
+
+### MANS geometry
+
+MANS indexes elements as `x + y*nx + z*nx*ny` (`nx` fastest). PhotonZip arrays and
+HDF5 chunks are C-ordered, so the codec and the H5Z-MANS filter pass the *last*
+dimension as `nx` (`nx = shape[-1]`, `ny = shape[-2]`, `nz = shape[-3]`). Passing
+`shape[0]` as `nx` (as the upstream H5Z-MANS plugin does) transposes the ADM tiles:
+still lossless, but e.g. a 8x512x512 volume chunk drops from ratio 1.96 to 1.48
+and decompresses at half the speed. The geometry is stored in every MANS stream,
+so streams written with either convention decode anywhere.
 
 ### Known limitations (DCU)
 
 - MANS runs in P-mode only; R-mode datasets cannot be decoded on the DCU.
-- MANS compression is bounded by its ADM stage, which upstream packs on the host
-  (~15 ms for 16 MiB). The upstream single-threaded ANS stream assembly
-  (~2 s for 16 MiB) is replaced here; see `3rdparty/lossless/MANS/VENDORED.md`.
 - MANS does not fall back to raw storage, so incompressible data expands.
+- One MANS stream holds at most 4 GiB of raw data.
 - DTK's compiler reports spurious `-Wreturn-type` warnings for `void` functions.
+- The MANS DCU sources carry local performance patches (stream format unchanged);
+  see `3rdparty/lossless/MANS/VENDORED.md`.
 
 To build the HDF5 plugin on its own:
 
@@ -189,17 +223,22 @@ Compression levels select the codec and are kept for codecs added later:
 
 | Option | Values | Current behaviour |
 |---|---|---|
-| `--quality-level` | `lossless` (default), `high`, `low` | only `lossless` is wired; `high`/`low` (error bound 1.0/8.0) raise `NotImplementedError` |
-| `--throughput-level` | `high`, `low` | `high` selects `lc` |
-| `--ratio-level` | `high`, `low` | falls back to the default lossless codec (`lc`) |
-| `--codec` | `lc`, `mans` | forces a codec, overriding the levels (`mans` needs `--backend dcu`) |
-| `--backend` | `cpu` (default), `dcu` | execution backend |
+| `--quality-level` | `lossless` (default), `high`, `low` | only `lossless` is wired; `high`/`low` (error bound 1.0/8.0) are rejected |
+| `--throughput-level` | `high`, `low` | both select `lc` |
+| `--ratio-level` | `high`, `low` | no effect yet (prints a warning); use `--codec` |
+| `--codec` | `lc`, `mans` | forces a codec, overriding the levels |
+| `--backend` | `cpu`, `dcu` | compress: `dcu` for `--codec mans`, else `cpu`; decompress: the backend recorded in the file (`dcu` for MANS) |
+| `--no-warmup` | | include the one-time DCU start-up (~50 ms) in the timings |
 
-Legacy aliases `--level`/`--fidelity`, `--speed` and `--ratio` are accepted.
+`--dims` is the C-order shape (slowest dimension first, 1 to 3 values). Legacy
+aliases `--level`/`--fidelity`, `--speed` and `--ratio` are accepted. Invalid
+arguments exit with status 2, runtime errors with status 1. `--delta` with MANS
+prints a warning: the signed differences are stored as uint16 bit patterns, which
+defeats MANS's range test (e.g. ratio 1.96 -> 1.42 on a volume chunk).
 
 The `.pzc` container is `b"PZC1"`, a little-endian uint64 metadata length,
 UTF-8 JSON metadata (`codec`, `backend`, `dtype`, `shape`, `codec_params`,
-`preprocess`), then the LC payload.
+`preprocess`), then the codec payload.
 
 Tensors that already live on the DCU (e.g. PyTorch on DTK, DLPack device
 `kDLROCM`) are compressed in place and the results stay on the device.
@@ -212,7 +251,7 @@ present; `PHOTONZIP_LC_BACKEND=cpu|dcu|auto` overrides that. The stored chunks
 are the same either way.
 
 `H5Z-MANS` (DCU builds) accepts uint16/uint32 datasets and takes the ADM geometry
-from the chunk shape. Pass `compression_opts=(0,)` (P-mode) or nothing. It
+from the chunk shape (last chunk dimension as `nx`, see "MANS geometry"). Pass `compression_opts=(0,)` (P-mode) or nothing. It
 stores the same parameters as the upstream MANS plugin, so the upstream CPU
 plugin can read the data; do not put both plugins on one `HDF5_PLUGIN_PATH`.
 
