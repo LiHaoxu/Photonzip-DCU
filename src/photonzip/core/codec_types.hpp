@@ -15,11 +15,13 @@ namespace photonzip {
 enum class Backend {
   kCpu,
   kCuda,
+  kDcu,
 };
 
 enum class MemoryKind {
   kHost,
   kCuda,
+  kDcu,  // HIP device memory on a Hygon DCU (DLPack kDLROCM)
 };
 
 enum class DataType {

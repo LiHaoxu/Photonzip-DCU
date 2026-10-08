@@ -9,6 +9,7 @@ from time import perf_counter
 import numpy as np
 import photonzip
 import photonzip.codec.lc as lc
+import photonzip.codec.mans as mans
 from photonzip.preprocess import apply_delta, invert_delta
 
 try:
@@ -18,9 +19,8 @@ except ImportError:
 
 
 MAGIC = b"PZC1"
-BACKEND = "cpu"
 LOSSLESS_CODEC = "lc"
-SUPPORTED_CODECS = ("lc",)
+SUPPORTED_CODECS = ("lc", "mans")
 QUALITY_LEVEL_ERROR_BOUNDS = {
     "lossless": 0.0,
     "high": 1.0,
@@ -29,12 +29,18 @@ QUALITY_LEVEL_ERROR_BOUNDS = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="PhotonZip LC CLI (lossless, CPU)")
+    parser = argparse.ArgumentParser(description="PhotonZip CLI (lossless; LC on CPU/DCU, MANS on DCU)")
     parser.add_argument("--mode", required=True, choices=("compress", "decompress", "roundtrip"))
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--dims", nargs="+", type=int, help="Input tensor shape, e.g. --dims 127 127 127")
     parser.add_argument("--dtype", choices=("uint16", "uint32"))
+    parser.add_argument(
+        "--backend",
+        default="cpu",
+        choices=("cpu", "dcu"),
+        help="Execution backend (default: cpu). LC payloads are identical on both backends.",
+    )
     level_group = parser.add_argument_group("compression levels")
     level_group.add_argument(
         "--quality-level",
@@ -84,6 +90,12 @@ def validate_args(args: argparse.Namespace) -> None:
             )
         if args.preprocess == "delta" and args.dtype != "uint16":
             raise ValueError("--delta currently supports --dtype uint16 only.")
+    if args.codec == "mans" and args.backend != "dcu":
+        raise ValueError("The MANS codec runs on the DCU only; pass --backend dcu.")
+    if args.codec is not None and args.codec not in photonzip.list_codecs():
+        raise ValueError(
+            f"Codec {args.codec!r} is not available in this build (available: {photonzip.list_codecs()})."
+        )
 
 
 def read_raw_array(path: Path, dtype_name: str, dims: list[int]) -> np.ndarray:
@@ -182,7 +194,11 @@ def make_codec_options(args: argparse.Namespace, tensor) -> tuple[str, object, l
     codec = select_lossless_codec(args)
     if codec == "lc":
         options = lc.LcOptions()
-        codec_params = options.to_codec_params(tensor=tensor, backend=BACKEND)
+        codec_params = options.to_codec_params(tensor=tensor, backend=args.backend)
+        return codec, options, codec_params
+    if codec == "mans":
+        options = mans.MansOptions()
+        codec_params = options.to_codec_params(tensor=tensor, backend=args.backend)
         return codec, options, codec_params
 
     raise ValueError(f"Unsupported lossless codec: {codec!r}.")
@@ -191,7 +207,7 @@ def make_codec_options(args: argparse.Namespace, tensor) -> tuple[str, object, l
 def compress_array(args: argparse.Namespace, array: np.ndarray):
     codec, codec_options, codec_params = make_codec_options(args, array)
     t0 = perf_counter()
-    packed = photonzip.compress(array, codec=codec, backend=BACKEND, codec_options=codec_options)
+    packed = photonzip.compress(array, codec=codec, backend=args.backend, codec_options=codec_options)
     t1 = perf_counter()
     return codec, packed, codec_params, t1 - t0
 
@@ -203,7 +219,7 @@ def run_compress(args: argparse.Namespace) -> None:
     write_container(
         args.output,
         codec=codec,
-        backend=BACKEND,
+        backend=args.backend,
         dtype=args.dtype,
         shape=array.shape,
         codec_params=codec_params,
@@ -220,11 +236,11 @@ def run_decompress(args: argparse.Namespace) -> None:
         payload,
         metadata["dtype"],
         metadata["shape"],
-        BACKEND,
+        args.backend,
         metadata["codec_params"],
     )
     t0 = perf_counter()
-    restored = photonzip.decompress(packed, backend=BACKEND)
+    restored = photonzip.decompress(packed, backend=args.backend)
     t1 = perf_counter()
     array = to_host_numpy(restored)
     preprocess = metadata.get("preprocess") or {"type": "none"}
@@ -240,7 +256,7 @@ def run_roundtrip(args: argparse.Namespace) -> None:
     compress_input, preprocess = prepare_compress_input(args, array)
     codec, packed, codec_params, compress_elapsed = compress_array(args, compress_input)
     t0 = perf_counter()
-    restored = photonzip.decompress(packed, backend=BACKEND)
+    restored = photonzip.decompress(packed, backend=args.backend)
     t1 = perf_counter()
     restored_array = to_host_numpy(restored)
     if preprocess.get("type") == "delta":
@@ -248,7 +264,7 @@ def run_roundtrip(args: argparse.Namespace) -> None:
     write_container(
         args.output,
         codec=codec,
-        backend=BACKEND,
+        backend=args.backend,
         dtype=args.dtype,
         shape=array.shape,
         codec_params=codec_params,

@@ -12,38 +12,35 @@ try:
 except ModuleNotFoundError:
     _native = import_module("_native")
 
-H5Z_FILTER_LC_ID = 32771
+# Same ID as the upstream H5Z-MANS plugin; see filters/include/photonzip_h5z_ids.h.
+H5Z_FILTER_MANS_ID = 32032
+MANS_MODE_P = 0
 
 
 @dataclass(frozen=True)
-class LcOptions(CodecOptions):
-    """Options for the LC codec.
+class MansOptions(CodecOptions):
+    """Options for the MANS codec.
 
-    The LC codec uses a fixed component pipeline (``DIFFMS_2 BIT_2 RZE_2``) and is
-    lossless, so there are no tunable codec parameters. It runs on the ``"cpu"``
-    backend and, in DCU builds, on the ``"dcu"`` backend; both produce the same
-    bitstream, so data compressed on one decompresses on the other. Global
-    preprocessing such as inter-slice delta (``photonzip.preprocess``) is applied
-    by the caller before compression and is therefore not configured here.
+    MANS (ADM mapping + ANS entropy coding) is lossless for uint16/uint32 tensors with
+    1 to 3 dimensions. In this build it runs on the DCU backend only, in P-mode, and has
+    no tunable parameters: the ADM geometry is taken from the tensor shape.
 
-    The matching HDF5 filter (``H5Z_FILTER_LC_ID``) takes no options either: the decoded
-    size travels in the payload header, so ``compression_opts`` can be left out entirely.
-    In DCU builds the filter runs on the DCU; set ``PHOTONZIP_LC_BACKEND=cpu`` to force
-    the CPU.
+    For the HDF5 filter (``H5Z_FILTER_MANS_ID``) the geometry comes from the chunk shape;
+    pass ``compression_opts=(MANS_MODE_P,)`` or leave it out.
     """
 
     @property
     def codec(self) -> str:
-        return "lc"
+        return "mans"
 
     def to_codec_params(self, *, tensor=None, backend: str = "auto") -> list[int]:
         return []
 
 
-class LcCodec(Codec):
+class MansCodec(Codec):
     @property
     def name(self) -> str:
-        return "lc"
+        return "mans"
 
     def compress(
         self,
@@ -69,4 +66,6 @@ class LcCodec(Codec):
         return _native.decompress_tensor(data, backend=backend)
 
 
-register_codec(LcCodec())
+# The native codec only exists in DCU builds; keep the Python registry in sync with it.
+if "mans" in _native.list_codecs():
+    register_codec(MansCodec())
