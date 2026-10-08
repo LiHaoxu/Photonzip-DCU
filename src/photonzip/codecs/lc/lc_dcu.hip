@@ -22,10 +22,12 @@
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "photonzip/codecs/lc/lc_dcu.hpp"
 
@@ -434,19 +436,55 @@ struct DeviceScratch {
   }
 };
 
+// Scratch buffers for one call. Workspaces are pooled per device and leased for the duration
+// of a call, so concurrent host threads (one per DCU, or several per DCU) never share one,
+// and a buffer is never used on a device it was not allocated on.
 struct Workspace {
-  std::mutex mutex;
   DeviceScratch control;  // counter, size and error words
   DeviceScratch carry;    // per-chunk carries for the encoder
   DeviceScratch input;    // staging buffers for the host wrappers
   DeviceScratch output;
+  int encode_blocks = 0;  // grid sizes for this device, computed on first use
+  int decode_blocks = 0;
 };
 
-Workspace& workspace()
-{
-  static Workspace* ws = new Workspace();  // intentionally leaked, see DeviceScratch
-  return *ws;
-}
+class WorkspaceLease {
+ public:
+  WorkspaceLease()
+  {
+    check_hip(hipGetDevice(&device_), "hipGetDevice");
+    std::lock_guard<std::mutex> lock(mutex());
+    auto& free_list = pool()[device_];
+    if (free_list.empty()) {
+      ws_ = new Workspace();  // intentionally leaked, see DeviceScratch
+    } else {
+      ws_ = free_list.back();
+      free_list.pop_back();
+    }
+  }
+  ~WorkspaceLease()
+  {
+    std::lock_guard<std::mutex> lock(mutex());
+    pool()[device_].push_back(ws_);
+  }
+  WorkspaceLease(const WorkspaceLease&) = delete;
+  WorkspaceLease& operator=(const WorkspaceLease&) = delete;
+  Workspace& operator*() const { return *ws_; }
+
+ private:
+  static std::mutex& mutex()
+  {
+    static std::mutex m;
+    return m;
+  }
+  static std::map<int, std::vector<Workspace*>>& pool()
+  {
+    static auto* p = new std::map<int, std::vector<Workspace*>>();
+    return *p;
+  }
+  int device_ = 0;
+  Workspace* ws_ = nullptr;
+};
 
 struct Control {
   unsigned long long counter;
@@ -467,8 +505,9 @@ int grid_size(const void* kernel)
   return prop.multiProcessorCount * per_cu;
 }
 
-// Callers hold workspace().mutex.
-long long encode_device_locked(Workspace& ws, const byte* d_input, long long insize, byte* d_output)
+// All work goes to the calling thread's default stream; with -fgpu-default-stream=per-thread
+// (set by the build) threads on the same DCU run concurrently.
+long long encode_device_ws(Workspace& ws, const byte* d_input, long long insize, byte* d_output)
 {
   if (insize < 0) {
     throw std::runtime_error("LC DCU: negative input size.");
@@ -483,13 +522,12 @@ long long encode_device_locked(Workspace& ws, const byte* d_input, long long ins
   const long long chunks = (insize + CS - 1) / CS;
   auto* control = static_cast<Control*>(ws.control.reserve(sizeof(Control), "hipMalloc control"));
   auto* carry = static_cast<long long*>(ws.carry.reserve(chunks * sizeof(long long), "hipMalloc carry"));
-  check_hip(hipMemset(control, 0, sizeof(Control)), "hipMemset control");
-  check_hip(hipMemset(carry, 0, chunks * sizeof(long long)), "hipMemset carry");
+  check_hip(hipMemsetAsync(control, 0, sizeof(Control), nullptr), "hipMemset control");
+  check_hip(hipMemsetAsync(carry, 0, chunks * sizeof(long long), nullptr), "hipMemset carry");
 
-  static const int blocks = grid_size(reinterpret_cast<const void*>(&d_encode));
-  d_encode<<<blocks, TPB>>>(d_input, insize, d_output, &control->size, carry, &control->counter);
+  if (ws.encode_blocks == 0) ws.encode_blocks = grid_size(reinterpret_cast<const void*>(&d_encode));
+  d_encode<<<ws.encode_blocks, TPB>>>(d_input, insize, d_output, &control->size, carry, &control->counter);
   check_hip(hipGetLastError(), "d_encode launch");
-  check_hip(hipDeviceSynchronize(), "d_encode");
 
   long long outsize = 0;
   check_hip(hipMemcpy(&outsize, &control->size, sizeof(outsize), hipMemcpyDeviceToHost), "size D2H");
@@ -499,8 +537,7 @@ long long encode_device_locked(Workspace& ws, const byte* d_input, long long ins
   return outsize;
 }
 
-// Callers hold workspace().mutex.
-long long decode_device_locked(Workspace& ws, const byte* d_input, byte* d_output, long long out_capacity)
+long long decode_device_ws(Workspace& ws, const byte* d_input, byte* d_output, long long out_capacity)
 {
   long long outsize = 0;
   check_hip(hipMemcpy(&outsize, d_input, sizeof(outsize), hipMemcpyDeviceToHost), "header D2H");
@@ -515,12 +552,11 @@ long long decode_device_locked(Workspace& ws, const byte* d_input, byte* d_outpu
   }
 
   auto* control = static_cast<Control*>(ws.control.reserve(sizeof(Control), "hipMalloc control"));
-  check_hip(hipMemset(control, 0, sizeof(Control)), "hipMemset control");
+  check_hip(hipMemsetAsync(control, 0, sizeof(Control), nullptr), "hipMemset control");
 
-  static const int blocks = grid_size(reinterpret_cast<const void*>(&d_decode));
-  d_decode<<<blocks, TPB>>>(d_input, d_output, &control->counter, &control->error);
+  if (ws.decode_blocks == 0) ws.decode_blocks = grid_size(reinterpret_cast<const void*>(&d_decode));
+  d_decode<<<ws.decode_blocks, TPB>>>(d_input, d_output, &control->counter, &control->error);
   check_hip(hipGetLastError(), "d_decode launch");
-  check_hip(hipDeviceSynchronize(), "d_decode");
 
   int error = 0;
   check_hip(hipMemcpy(&error, &control->error, sizeof(error), hipMemcpyDeviceToHost), "error D2H");
@@ -540,16 +576,14 @@ bool device_available()
 
 long long encode_device(const byte* d_input, long long insize, byte* d_output)
 {
-  Workspace& ws = workspace();
-  std::lock_guard<std::mutex> lock(ws.mutex);
-  return encode_device_locked(ws, d_input, insize, d_output);
+  WorkspaceLease ws;
+  return encode_device_ws(*ws, d_input, insize, d_output);
 }
 
 long long decode_device(const byte* d_input, byte* d_output, long long out_capacity)
 {
-  Workspace& ws = workspace();
-  std::lock_guard<std::mutex> lock(ws.mutex);
-  return decode_device_locked(ws, d_input, d_output, out_capacity);
+  WorkspaceLease ws;
+  return decode_device_ws(*ws, d_input, d_output, out_capacity);
 }
 
 long long decoded_size_device(const byte* d_input)
@@ -561,15 +595,15 @@ long long decoded_size_device(const byte* d_input)
 
 long long encode_host(const byte* input, long long insize, byte* output)
 {
-  Workspace& ws = workspace();
-  std::lock_guard<std::mutex> lock(ws.mutex);
+  WorkspaceLease lease;
+  Workspace& ws = *lease;
   const long long capacity = max_encoded_size(insize);
   auto* d_in = static_cast<byte*>(ws.input.reserve(insize > 0 ? insize : 1, "hipMalloc input"));
   auto* d_out = static_cast<byte*>(ws.output.reserve(capacity, "hipMalloc output"));
   if (insize > 0) {
     check_hip(hipMemcpy(d_in, input, insize, hipMemcpyHostToDevice), "input H2D");
   }
-  const long long outsize = encode_device_locked(ws, d_in, insize, d_out);
+  const long long outsize = encode_device_ws(ws, d_in, insize, d_out);
   check_hip(hipMemcpy(output, d_out, outsize, hipMemcpyDeviceToHost), "output D2H");
   return outsize;
 }
@@ -585,12 +619,12 @@ long long decode_host(const byte* input, long long insize, byte* output, long lo
     throw std::runtime_error("LC DCU: output buffer is too small.");
   }
 
-  Workspace& ws = workspace();
-  std::lock_guard<std::mutex> lock(ws.mutex);
+  WorkspaceLease lease;
+  Workspace& ws = *lease;
   auto* d_in = static_cast<byte*>(ws.input.reserve(insize, "hipMalloc input"));
   auto* d_out = static_cast<byte*>(ws.output.reserve(outsize > 0 ? outsize : 1, "hipMalloc output"));
   check_hip(hipMemcpy(d_in, input, insize, hipMemcpyHostToDevice), "input H2D");
-  const long long produced = decode_device_locked(ws, d_in, d_out, outsize);
+  const long long produced = decode_device_ws(ws, d_in, d_out, outsize);
   if (produced > 0) {
     check_hip(hipMemcpy(output, d_out, produced, hipMemcpyDeviceToHost), "output D2H");
   }
