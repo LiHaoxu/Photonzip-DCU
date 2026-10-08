@@ -2,13 +2,14 @@
 //
 //   photonzip_dcu_bench <raw file> [--dtype u16|u32] [--dims d0 [d1 [d2]]] [--iters N]
 //                       [--dump PREFIX]   (writes PREFIX.lc and PREFIX.mans)
-//                       [--only lc|mans] [--chunk-rows R [--parallel D T]]
+//                       [--only lc|mans] [--chunk-rows R [--parallel D T] [--host-only]]
 //
 // --dims is the C-order shape (slowest dimension first, as in NumPy/HDF5); MANS receives the
 // fastest dimension as nx, like the photonzip codec and the H5Z-MANS filter.
 // --chunk-rows R also times the host-memory API (host in, host out, as used by Python and
 // the HDF5 filters) on chunks of R slices along the first dimension, one call per chunk.
-// --parallel D T spreads those chunks over D DCUs with T host threads per DCU.
+// --parallel D T spreads those chunks over D DCUs with T host threads per DCU, and
+// --host-only skips the whole-array device-resident runs.
 //
 // The input is copied to the DCU once; every timed call reads and writes device memory, so
 // the numbers exclude PCIe transfers and Python overhead. Each result is verified against
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -116,7 +118,7 @@ void report(const char* name, std::size_t raw, std::size_t packed, double tc, do
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr, "usage: %s <raw file> [--dtype u16|u32] [--dims d0 [d1 [d2]]] [--iters N] "
-                         "[--dump PREFIX] [--only lc|mans] [--chunk-rows R]\n", argv[0]);
+                         "[--dump PREFIX] [--only lc|mans] [--chunk-rows R [--parallel D T] [--host-only]]\n", argv[0]);
     return 2;
   }
   std::string dtype = "u16";
@@ -126,6 +128,7 @@ int main(int argc, char** argv) {
   std::string only;
   std::size_t chunk_rows = 0;
   int par_devices = 1, par_threads = 1;
+  bool host_only = false;
   for (int i = 2; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--dtype" && i + 1 < argc) {
@@ -134,6 +137,8 @@ int main(int argc, char** argv) {
       iters = std::max(1, std::atoi(argv[++i]));
     } else if (arg == "--only" && i + 1 < argc) {
       only = argv[++i];
+    } else if (arg == "--host-only") {
+      host_only = true;
     } else if (arg == "--parallel" && i + 2 < argc) {
       par_devices = std::max(1, std::atoi(argv[++i]));
       par_threads = std::max(1, std::atoi(argv[++i]));
@@ -196,7 +201,7 @@ int main(int argc, char** argv) {
   }
 
   // ---- LC (DIFFMS_2 BIT_2 RZE_2) ----
-  if (only.empty() || only == "lc") {
+  if ((only.empty() || only == "lc") && !host_only) {
     const long long chunks = (static_cast<long long>(raw) + 16383) / 16384;
     DeviceBuffer d_lc(16 + chunks * 2 + chunks * 16384);
     long long packed = 0;
@@ -210,27 +215,33 @@ int main(int argc, char** argv) {
     report("lc", raw, packed, tc, td, ok);
     if (!dump_prefix.empty()) dump(dump_prefix + ".lc", d_lc.ptr, static_cast<std::size_t>(packed));
     status |= ok ? 0 : 1;
-
-    if (chunk_rows) {
-      std::vector<std::vector<unsigned char>> streams(chunk_list.size());
-      std::vector<std::uint8_t> restored(raw);
+  }
+  if ((only.empty() || only == "lc") && chunk_rows) {
+    {
+      // Output buffers are allocated once, uninitialised (like the Python API's host buffers),
+      // so the timed loop measures only the codec calls.
+      std::vector<std::unique_ptr<unsigned char[]>> streams(chunk_list.size());
+      std::vector<std::size_t> sizes(chunk_list.size());
+      for (std::size_t c = 0; c < chunk_list.size(); ++c) {
+        const std::size_t bytes = chunk_list[c].second * row_elems * width;
+        streams[c].reset(new unsigned char[16 + (bytes / 16384 + 1) * (2 + 16384)]);
+      }
+      std::unique_ptr<std::uint8_t[]> restored(new std::uint8_t[raw]);
       std::size_t total = 0;
       const double hc = time_median(iters, [&] {
         for_chunks(chunk_list.size(), par_devices, par_threads, [&](std::size_t c) {
           const std::size_t off = chunk_list[c].first * row_elems * width, bytes = chunk_list[c].second * row_elems * width;
-          streams[c].resize(16 + (bytes / 16384 + 1) * (2 + 16384));
-          const long long out = photonzip::lc::dcu::encode_host(host.data() + off, bytes, streams[c].data());
-          streams[c].resize(out);
+          sizes[c] = static_cast<std::size_t>(photonzip::lc::dcu::encode_host(host.data() + off, bytes, streams[c].get()));
         });
       });
-      for (const auto& st : streams) total += st.size();
+      for (const auto sz : sizes) total += sz;
       const double hd = time_median(iters, [&] {
         for_chunks(chunk_list.size(), par_devices, par_threads, [&](std::size_t c) {
           const std::size_t off = chunk_list[c].first * row_elems * width, bytes = chunk_list[c].second * row_elems * width;
-          photonzip::lc::dcu::decode_host(streams[c].data(), streams[c].size(), restored.data() + off, bytes);
+          photonzip::lc::dcu::decode_host(streams[c].get(), sizes[c], restored.get() + off, bytes);
         });
       });
-      const bool hok = std::memcmp(restored.data(), host.data(), raw) == 0;
+      const bool hok = std::memcmp(restored.get(), host.data(), raw) == 0;
       report("lc host", raw, total, hc, hd, hok);
       status |= hok ? 0 : 1;
     }
@@ -247,6 +258,7 @@ int main(int argc, char** argv) {
     p.nx = dims[rank - 1];
     p.ny = rank > 1 ? dims[rank - 2] : 0;
     p.nz = rank > 2 ? dims[rank - 3] : 0;
+    if (!host_only) {
     const std::size_t cap = mans::dcu::get_max_compress_bytes(n, p);
     DeviceBuffer d_mans(cap);
     std::size_t packed = 0;
@@ -292,36 +304,40 @@ int main(int argc, char** argv) {
     std::printf("  mans stages: ADM encode %.3f ms (%zu B), ANS encode %.3f ms (%zu B), "
                 "ANS decode %.3f ms, ADM decode %.3f ms\n",
                 t_adm * 1e3, adm_size, t_ans * 1e3, ans_size, t_ians * 1e3, t_iadm * 1e3);
+    }
 
     if (chunk_rows) {
-      std::vector<std::vector<std::uint8_t>> streams(chunk_list.size());
+      // Output buffers are allocated once, uninitialised, outside the timed loop.
+      std::vector<std::unique_ptr<std::uint8_t[]>> streams(chunk_list.size());
+      std::vector<std::size_t> caps(chunk_list.size()), sizes(chunk_list.size());
       std::vector<mans::MansParams> params(chunk_list.size(), p);
-      std::vector<std::uint8_t> restored(raw);
+      std::unique_ptr<std::uint8_t[]> restored(new std::uint8_t[raw]);
       std::size_t total = 0;
       for (std::size_t c = 0; c < chunk_list.size(); ++c) {
         const auto rows = static_cast<std::uint32_t>(chunk_list[c].second);
         if (rank == 1) params[c].nx = rows;
         else if (rank == 2) params[c].ny = rows;
         else params[c].nz = rows;
+        caps[c] = mans::dcu::get_max_compress_bytes(chunk_list[c].second * row_elems, params[c]);
+        streams[c].reset(new std::uint8_t[caps[c]]);
       }
       const double hc = time_median(iters, [&] {
         for_chunks(chunk_list.size(), par_devices, par_threads, [&](std::size_t c) {
           const std::size_t off = chunk_list[c].first * row_elems * width, elems = chunk_list[c].second * row_elems;
-          std::size_t out = mans::dcu::get_max_compress_bytes(elems, params[c]);
-          streams[c].resize(out);
-          mans::dcu::compress_internal(host.data() + off, elems, params[c], streams[c].data(), out);
-          streams[c].resize(out);
+          std::size_t out = caps[c];
+          mans::dcu::compress_internal(host.data() + off, elems, params[c], streams[c].get(), out);
+          sizes[c] = out;
         });
       });
-      for (const auto& st : streams) total += st.size();
+      for (const auto sz : sizes) total += sz;
       const double hd = time_median(iters, [&] {
         for_chunks(chunk_list.size(), par_devices, par_threads, [&](std::size_t c) {
           const std::size_t off = chunk_list[c].first * row_elems * width, bytes = chunk_list[c].second * row_elems * width;
           std::size_t out = bytes;
-          mans::dcu::decompress_internal(streams[c].data(), streams[c].size(), params[c], restored.data() + off, out);
+          mans::dcu::decompress_internal(streams[c].get(), sizes[c], params[c], restored.get() + off, out);
         });
       });
-      const bool hok = std::memcmp(restored.data(), host.data(), raw) == 0;
+      const bool hok = std::memcmp(restored.get(), host.data(), raw) == 0;
       report("mans host", raw, total, hc, hd, hok);
       status |= hok ? 0 : 1;
     }
