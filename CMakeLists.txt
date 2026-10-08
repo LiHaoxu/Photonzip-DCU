@@ -127,3 +127,11 @@ endif()
 if(PHOTONZIP_BUILD_PYTHON)
   add_subdirectory(bindings/python)
 endif()
+
+if(PHOTONZIP_ENABLE_DCU)
+  # Device-resident throughput benchmark (benchmarks/dcu_bench.cpp).
+  add_executable(photonzip_dcu_bench benchmarks/dcu_bench.cpp)
+  set_source_files_properties(benchmarks/dcu_bench.cpp PROPERTIES LANGUAGE HIP)
+  target_link_libraries(photonzip_dcu_bench PRIVATE photonzip_dcu)
+  set_target_properties(photonzip_dcu_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+endif()

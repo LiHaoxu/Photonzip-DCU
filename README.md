@@ -23,10 +23,15 @@ and tomography data. It ships two codecs:
 Both codecs can be combined with the optional global inter-slice delta
 preprocessing (`photonzip.preprocess`).
 
-> **Status:** the CPU path is tested, and its LC output is byte-identical to the
-> LC framework's standalone CPU compressor. The DCU sources compile for gfx906
-> (wave64) with HIP/Clang but have not been run on DCU hardware yet; use
-> `tests/test_dcu.py` to validate a build.
+> **Status:** tested on a Hygon BW DCU (gfx936, 80 CUs) with DTK 26.04, and with
+> DTK 25.04.1 + PyTorch 2.5.1 for device tensors:
+>
+> - LC payloads from the DCU are byte-identical to the LC framework's official
+>   standalone CPU and GPU compressors, and both official decoders read them.
+> - MANS streams from the DCU decode with the upstream MANS CPU backend and vice
+>   versa (P-mode); the upstream MANS DCU/CPU test suite passes.
+> - HDF5 files written with the DCU filters read back with the CPU paths
+>   (`PHOTONZIP_LC_BACKEND=cpu`, upstream H5Z-MANS) and vice versa.
 
 The Python layer is DLPack-based; `compress(...)` and `decompress(...)` return
 a `PhotonZipArray`, which converts to NumPy with `np.from_dlpack(...)`.
@@ -43,7 +48,8 @@ bindings/python/           pybind11 extension module photonzip._native
 python/photonzip/          Python package (API, LC codec, preprocessing)
 filters/                   HDF5 filter plugins H5Z-LC and H5Z-MANS
 examples/photonzip_cli.py  command-line tool with the .pzc container format
-tests/test_dcu.py          DCU correctness and throughput checks
+tests/test_dcu.py          DCU correctness checks (Python API, device tensors, HDF5)
+benchmarks/dcu_bench.cpp   device-resident DCU throughput benchmark
 ```
 
 ## Install
@@ -63,8 +69,10 @@ python3 -m pip install . -Ccmake.define.PHOTONZIP_BUILD_HDF5_FILTERS=OFF
 
 ### DCU build
 
-Requirements: Hygon DTK (`hipcc`), CMake >= 3.21. Set the architecture of your
-DCU (`rocminfo | grep gfx`). Configure flags are forwarded through scikit-build:
+Requirements: Hygon DTK (`hipcc`), CMake >= 3.21. Load the DTK first
+(`module load compiler/dtk/...` or `source $DTK/env.sh`) and set the
+architecture of your DCU (`rocminfo | grep gfx`; e.g. BW is `gfx936`).
+Configure flags are forwarded through scikit-build:
 
 ```bash
 python3 -m pip install . \
@@ -79,11 +87,41 @@ cmake --build build -j
 # -> build/bin/plugins/libH5Z-LC.so, build/bin/plugins/libH5Z-MANS.so
 
 python3 tests/test_dcu.py --plugins build/bin/plugins
+build/bin/photonzip_dcu_bench data.u2 --dims 8192 1024   # needs a DCU
 ```
+
+For the HDF5 filters, use a serial, shared HDF5 and make sure h5py links the
+same `libhdf5` as the plugins (e.g. `HDF5_DIR=... pip install --no-binary=h5py h5py`);
+two HDF5 copies in one process break filter callbacks.
 
 If the DTK compiler cannot find the host C++ headers (`fatal error: 'cmath' file
 not found`), pass them via `PHOTONZIP_DCU_HIP_FLAGS`, e.g.
 `-DPHOTONZIP_DCU_HIP_FLAGS="-isystem /usr/include/c++/11 -isystem /usr/include/x86_64-linux-gnu/c++/11"`.
+
+### DCU performance
+
+`photonzip_dcu_bench`, Hygon BW (gfx936), DTK 26.04, data already in device
+memory (no PCIe transfers), median of 5 runs. The Python API and the HDF5
+filters add host<->device copies and per-call setup on top of this.
+
+| Input | LC ratio | LC compress / decompress | MANS ratio | MANS compress / decompress |
+|---|---|---|---|---|
+| EXAFEL uint16, 16 MiB (8192x1024) | 1.831 | 57.9 / 55.6 GB/s | 1.681 | 0.99 / 5.89 GB/s |
+| smooth uint16, 2 MB (1D) | 5.151 | 21.1 / 21.0 GB/s | 2.065 | 0.45 / 4.25 GB/s |
+| uniform random uint16, 4 MB | 1.000 | 30.1 / 41.8 GB/s | 0.824 | 0.44 / 3.16 GB/s |
+| uint32, 2 MB (512x1000) | 1.450 | 21.6 / 20.9 GB/s | 2.665 | 0.46 / 4.17 GB/s |
+
+The official LC GPU compressor for the same pipeline, built for gfx936, reaches
+56.1 GB/s (compress) on the EXAFEL input.
+
+### Known limitations (DCU)
+
+- MANS runs in P-mode only; R-mode datasets cannot be decoded on the DCU.
+- MANS compression is bounded by its ADM stage, which upstream packs on the host
+  (~15 ms for 16 MiB). The upstream single-threaded ANS stream assembly
+  (~2 s for 16 MiB) is replaced here; see `3rdparty/lossless/MANS/VENDORED.md`.
+- MANS does not fall back to raw storage, so incompressible data expands.
+- DTK's compiler reports spurious `-Wreturn-type` warnings for `void` functions.
 
 To build the HDF5 plugin on its own:
 
