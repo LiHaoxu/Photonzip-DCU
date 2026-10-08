@@ -77,7 +77,8 @@ def parse_args() -> argparse.Namespace:
         dest="preprocess",
         action="store_const",
         const="delta",
-        help="Apply global inter-slice delta preprocessing (axis 0) before compression.",
+        help="Apply global inter-slice delta preprocessing (axis 0) before compression "
+        "(stored as int16 bit patterns for LC, as difference + 32768 for MANS).",
     )
     parser.add_argument(
         "--preprocess",
@@ -130,8 +131,6 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error(f"one MANS stream holds at most 4 GiB of raw data ({nbytes} bytes requested)")
     if args.codec is None and args.ratio_level is not None:
         warn("--ratio-level has no effect yet (the default codec lc is used); choose a codec with --codec")
-    if codec == "mans" and args.preprocess == "delta":
-        warn("--delta stores signed differences as uint16 bit patterns, which usually lowers the MANS ratio")
 
 
 def read_raw_array(path: Path, dtype_name: str, dims: list[int]) -> np.ndarray:
@@ -201,7 +200,9 @@ def print_roundtrip_stats(nbytes: int, compress_elapsed: float, decompress_elaps
 
 def prepare_compress_input(args: argparse.Namespace, array: np.ndarray) -> tuple[np.ndarray, dict]:
     if args.preprocess == "delta":
-        delta_array, preprocess = apply_delta(array)
+        # MANS needs order-preserving differences (see photonzip.preprocess.DELTA_ENCODINGS).
+        encoding = "offset" if select_lossless_codec(args) == "mans" else "int16"
+        delta_array, preprocess = apply_delta(array, encoding=encoding)
         if not preprocess["lossless"]:
             print(
                 f"delta_overflow_pixels: {preprocess['overflow_pixels']} "
