@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "../mans_utils.h"
+#include "dcu_workspace.h"
 #include "ans/dcu_ans.h"
 #include "adm/adm_reference.h"
 #include "adm/mapping_uint16.h"
@@ -22,22 +23,6 @@ constexpr std::uint8_t kDcuCodec = Codec::ADM;
 void check_hip(hipError_t status, const char* what) {
     if (status != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(status));
 }
-
-class DeviceBuffer {
-public:
-    DeviceBuffer() = default;
-    DeviceBuffer(const DeviceBuffer&) = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-    ~DeviceBuffer() { reset(); }
-    void allocate(std::size_t bytes, const char* what) {
-        reset();
-        if (bytes != 0) check_hip(hipMalloc(&ptr_, bytes), what);
-    }
-    void reset() { if (ptr_) (void)hipFree(ptr_); ptr_ = nullptr; }
-    std::uint8_t* get() const { return ptr_; }
-private:
-    std::uint8_t* ptr_ = nullptr;
-};
 
 std::size_t raw_bytes_for(std::size_t length, std::uint32_t dtype) {
     std::size_t element_size = 0;
@@ -93,10 +78,11 @@ void compress_device_t(const T* d_input, std::size_t n, const MansParams& p,
     validate_geometry(n, p);
     const std::size_t raw_bytes = raw_bytes_for(n, p.dtype);
     const std::size_t adm_capacity = max_adm_bytes<T>(n, p);
-    DeviceBuffer d_adm;
-    d_adm.allocate(adm_capacity, "hipMalloc DCU ADM payload");
+    // [PhotonZip] scratch from a reusable workspace instead of hipMalloc per call
+    WorkspaceLease ws(kMansPool);
+    std::uint8_t* d_adm = ws->get<std::uint8_t>(0, adm_capacity);
     std::size_t adm_size = 0;
-    compress_adm(d_input, n, p, d_adm.get(), adm_size);
+    compress_adm(d_input, n, p, d_adm, adm_size);
     if (adm_size == 0 || adm_size > adm_capacity) throw std::runtime_error("mans::dcu: ADM encode failed");
 
     const std::size_t entropy_capacity = ans::get_max_compressed_size(adm_size);
@@ -105,7 +91,7 @@ void compress_device_t(const T* d_input, std::size_t n, const MansParams& p,
         throw std::runtime_error("mans::dcu: output buffer is too small");
     }
     std::size_t entropy_size = entropy_capacity;
-    ans::compress_device(d_adm.get(), adm_size, d_out + kMansHeaderBytes,
+    ans::compress_device(d_adm, adm_size, d_out + kMansHeaderBytes,
                          capacity - kMansHeaderBytes, entropy_size);
     std::uint8_t header[kMansHeaderBytes] = {};
     mans::write_mans_header(header, raw_bytes, kDcuCodec, Mode::P,
@@ -134,8 +120,8 @@ void decompress_device_t(const std::uint8_t* d_input, std::size_t length, const 
     effective.ny = static_cast<std::uint32_t>(header.ny);
     effective.nz = static_cast<std::uint32_t>(header.nz);
     const std::size_t adm_capacity = max_adm_bytes<T>(raw_bytes / sizeof(T), effective);
-    DeviceBuffer d_adm;
-    d_adm.allocate(adm_capacity, "hipMalloc DCU decoded ADM payload");
+    WorkspaceLease ws(kMansPool);
+    std::uint8_t* d_adm = ws->get<std::uint8_t>(1, adm_capacity);
 
     const std::size_t entropy_size = length - kMansHeaderBytes;
     if (entropy_size < 12) throw std::runtime_error("mans::dcu: ANS payload is too small");
@@ -146,9 +132,9 @@ void decompress_device_t(const std::uint8_t* d_input, std::size_t length, const 
     if (adm_size == 0 || adm_size > adm_capacity) throw std::runtime_error("mans::dcu: invalid ANS decoded size");
     std::size_t decoded_size = adm_size;
     ans::decompress_device(d_input + kMansHeaderBytes, entropy_size,
-                           d_adm.get(), adm_capacity, decoded_size);
+                           d_adm, adm_capacity, decoded_size);
     if (decoded_size != adm_size) throw std::runtime_error("mans::dcu: ANS decode size mismatch");
-    decompress_adm(d_adm.get(), adm_size, d_output, raw_bytes / sizeof(T), effective);
+    decompress_adm(d_adm, adm_size, d_output, raw_bytes / sizeof(T), effective);
     out_size = raw_bytes;
 }
 
@@ -183,14 +169,15 @@ void compress_internal(const void* input_data, std::size_t length, const MansPar
     const std::size_t capacity = out_size;
     out_size = 0;
     const std::size_t raw_bytes = raw_bytes_for(length, p.dtype);
-    DeviceBuffer d_input, d_output;
-    d_input.allocate(raw_bytes, "hipMalloc DCU raw input");
-    d_output.allocate(get_max_compress_bytes(length, p), "hipMalloc DCU compressed output");
-    check_hip(hipMemcpy(d_input.get(), input_data, raw_bytes, hipMemcpyHostToDevice), "DCU raw input H2D");
-    std::size_t device_size = d_output.get() ? get_max_compress_bytes(length, p) : 0;
-    compress_internal_device(d_input.get(), length, p, d_output.get(), device_size);
+    const std::size_t max_bytes = get_max_compress_bytes(length, p);
+    WorkspaceLease ws(kMansHostPool);
+    std::uint8_t* d_input = ws->get<std::uint8_t>(0, raw_bytes);
+    std::uint8_t* d_output = ws->get<std::uint8_t>(1, max_bytes);
+    check_hip(hipMemcpy(d_input, input_data, raw_bytes, hipMemcpyHostToDevice), "DCU raw input H2D");
+    std::size_t device_size = max_bytes;
+    compress_internal_device(d_input, length, p, d_output, device_size);
     if (device_size > capacity) throw std::runtime_error("mans::dcu: output buffer is too small");
-    check_hip(hipMemcpy(out, d_output.get(), device_size, hipMemcpyDeviceToHost), "DCU compressed output D2H");
+    check_hip(hipMemcpy(out, d_output, device_size, hipMemcpyDeviceToHost), "DCU compressed output D2H");
     out_size = device_size;
 }
 
@@ -200,14 +187,14 @@ void decompress_internal(const void* input_data, std::size_t length, const MansP
     const std::size_t capacity = out_size;
     out_size = 0;
     const std::size_t raw_bytes = get_exact_decompress_bytes(input_data, length, p);
-    DeviceBuffer d_input, d_output;
-    d_input.allocate(length, "hipMalloc DCU compressed input");
-    d_output.allocate(raw_bytes, "hipMalloc DCU raw output");
-    check_hip(hipMemcpy(d_input.get(), input_data, length, hipMemcpyHostToDevice), "DCU compressed input H2D");
+    WorkspaceLease ws(kMansHostPool);
+    std::uint8_t* d_input = ws->get<std::uint8_t>(2, length);
+    std::uint8_t* d_output = ws->get<std::uint8_t>(3, raw_bytes);
+    check_hip(hipMemcpy(d_input, input_data, length, hipMemcpyHostToDevice), "DCU compressed input H2D");
     std::size_t device_size = raw_bytes;
-    decompress_internal_device(d_input.get(), length, p, d_output.get(), device_size);
+    decompress_internal_device(d_input, length, p, d_output, device_size);
     if (device_size > capacity) throw std::runtime_error("mans::dcu: output buffer is too small");
-    check_hip(hipMemcpy(out, d_output.get(), device_size, hipMemcpyDeviceToHost), "DCU raw output D2H");
+    check_hip(hipMemcpy(out, d_output, device_size, hipMemcpyDeviceToHost), "DCU raw output D2H");
     out_size = device_size;
 }
 
