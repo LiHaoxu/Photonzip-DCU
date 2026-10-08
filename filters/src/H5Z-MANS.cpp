@@ -19,10 +19,14 @@
 // =========================================================
 //
 // Accepts uint16 and uint32 datasets. The geometry passed to ADM is taken from the HDF5
-// chunk shape in set_local, following the upstream H5Z-MANS plugin:
-//   1D chunk  -> nx
-//   2D chunk  -> nx, ny
-//   3D+ chunk -> nx, ny, nz = product of the remaining chunk dims
+// chunk shape in set_local. MANS indexes x + y * nx + z * nx * ny (nx fastest), and HDF5
+// chunks are C-ordered (last dim fastest), so for chunk dims (d0, ..., dk):
+//   1D chunk  -> nx = d0
+//   2D chunk  -> nx = d1, ny = d0
+//   3D+ chunk -> nx = dk, ny = dk-1, nz = product of the remaining (slower) dims
+// The upstream plugin uses nx = d0 instead, which transposes the ADM tiles (still lossless,
+// lower ratio). Decoding uses the geometry stored in each chunk's stream header, so either
+// plugin reads data written by the other.
 //
 // Public parameters (compression_opts): none, or a single mode word that must be 0 (P-mode);
 // the DCU backend does not implement R-mode. set_local expands them to the upstream layout
@@ -72,17 +76,18 @@ bool apply_chunk_dims(const std::vector<hsize_t>& chunk_dims, mans::MansParams& 
     error = "chunk dims are empty";
     return false;
   }
-  params.dims = static_cast<std::uint32_t>(chunk_dims.size() < 3 ? chunk_dims.size() : 3);
+  const std::size_t rank = chunk_dims.size();
+  params.dims = static_cast<std::uint32_t>(rank < 3 ? rank : 3);
   params.nx = params.ny = params.nz = 0;
-  if (!to_u32(chunk_dims[0], "nx", params.nx)) {
+  if (!to_u32(chunk_dims[rank - 1], "nx", params.nx)) {
     return false;
   }
-  if (chunk_dims.size() >= 2 && !to_u32(chunk_dims[1], "ny", params.ny)) {
+  if (rank >= 2 && !to_u32(chunk_dims[rank - 2], "ny", params.ny)) {
     return false;
   }
-  if (chunk_dims.size() >= 3) {
+  if (rank >= 3) {
     std::uint64_t merged_z = 1;
-    for (std::size_t i = 2; i < chunk_dims.size(); ++i) {
+    for (std::size_t i = 0; i + 2 < rank; ++i) {
       const auto d = static_cast<std::uint64_t>(chunk_dims[i]);
       if (d == 0 || merged_z > u32_max / d) {
         error = "invalid nz in chunk dims";
