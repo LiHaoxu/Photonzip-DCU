@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import struct
+import sys
 from pathlib import Path
 from time import perf_counter
 
@@ -21,6 +22,7 @@ except ImportError:
 MAGIC = b"PZC1"
 LOSSLESS_CODEC = "lc"
 SUPPORTED_CODECS = ("lc", "mans")
+MANS_MAX_BYTES = (1 << 32) - 1  # one MANS stream holds at most 4 GiB of raw data
 QUALITY_LEVEL_ERROR_BOUNDS = {
     "lossless": 0.0,
     "high": 1.0,
@@ -37,9 +39,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("uint16", "uint32"))
     parser.add_argument(
         "--backend",
-        default="cpu",
         choices=("cpu", "dcu"),
-        help="Execution backend (default: cpu). LC payloads are identical on both backends.",
+        help="Execution backend. Default for compress/roundtrip: dcu for --codec mans, cpu otherwise; "
+        "for decompress: the backend recorded in the file (dcu for MANS, cpu if this build has no DCU). "
+        "LC payloads are identical on both backends.",
+    )
+    parser.add_argument(
+        "--no-warmup",
+        dest="warmup",
+        action="store_false",
+        help="Do not initialise the DCU before timing. By default a tiny untimed call runs first, "
+        "so the reported throughput excludes the one-time DCU runtime start-up (~50 ms).",
     )
     level_group = parser.add_argument_group("compression levels")
     level_group.add_argument(
@@ -49,8 +59,10 @@ def parse_args() -> argparse.Namespace:
         choices=tuple(QUALITY_LEVEL_ERROR_BOUNDS),
         help="Quality level: lossless, high, or low.",
     )
-    level_group.add_argument("--throughput-level", choices=("high", "low"), help="Throughput level.")
-    level_group.add_argument("--ratio-level", choices=("high", "low"), help="Compression-ratio level.")
+    level_group.add_argument("--throughput-level", choices=("high", "low"),
+                             help="Throughput level (currently both values select lc).")
+    level_group.add_argument("--ratio-level", choices=("high", "low"),
+                             help="Compression-ratio level (currently has no effect; use --codec).")
     parser.add_argument("--level", dest="quality_level", choices=tuple(QUALITY_LEVEL_ERROR_BOUNDS), help=argparse.SUPPRESS)
     parser.add_argument("--fidelity", dest="quality_level", choices=tuple(QUALITY_LEVEL_ERROR_BOUNDS), help=argparse.SUPPRESS)
     parser.add_argument("--speed", dest="throughput_level", choices=("high", "low"), help=argparse.SUPPRESS)
@@ -73,29 +85,53 @@ def parse_args() -> argparse.Namespace:
         choices=("none", "delta"),
         help="Global preprocessing applied before compression (default: none).",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    validate_args(parser, args)
+    return args
 
 
-def validate_args(args: argparse.Namespace) -> None:
-    if args.mode in ("compress", "roundtrip"):
-        if not args.dims:
-            raise ValueError("--dims is required for compress and roundtrip modes.")
-        if args.dtype is None:
-            raise ValueError("--dtype is required for compress and roundtrip modes.")
-        if args.quality_level != "lossless":
-            error_bound = QUALITY_LEVEL_ERROR_BOUNDS[args.quality_level]
-            raise NotImplementedError(
-                f"Lossy compression is not wired yet for quality_level={args.quality_level!r} "
-                f"(preset error_bound={error_bound})."
-            )
-        if args.preprocess == "delta" and args.dtype != "uint16":
-            raise ValueError("--delta currently supports --dtype uint16 only.")
-    if args.codec == "mans" and args.backend != "dcu":
-        raise ValueError("The MANS codec runs on the DCU only; pass --backend dcu.")
+def dcu_available() -> bool:
+    # The MANS codec is only compiled into DCU builds.
+    return "mans" in photonzip.list_codecs()
+
+
+def warn(message: str) -> None:
+    print(f"warning: {message}", file=sys.stderr)
+
+
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.codec is not None and args.codec not in photonzip.list_codecs():
-        raise ValueError(
-            f"Codec {args.codec!r} is not available in this build (available: {photonzip.list_codecs()})."
+        parser.error(f"codec {args.codec!r} is not available in this build (available: {photonzip.list_codecs()})")
+    if args.backend == "dcu" and not dcu_available():
+        parser.error("--backend dcu needs a DCU build (configure with -DPHOTONZIP_ENABLE_DCU=ON)")
+    if args.mode not in ("compress", "roundtrip"):
+        return
+    if not args.dims:
+        parser.error("--dims is required for compress and roundtrip modes")
+    if args.dtype is None:
+        parser.error("--dtype is required for compress and roundtrip modes")
+    if not 1 <= len(args.dims) <= 3 or min(args.dims) <= 0:
+        parser.error("--dims takes 1 to 3 positive sizes (C order, slowest dimension first)")
+    if args.quality_level != "lossless":
+        parser.error(
+            f"lossy compression is not wired yet (--quality-level {args.quality_level}, "
+            f"preset error bound {QUALITY_LEVEL_ERROR_BOUNDS[args.quality_level]})"
         )
+    if args.preprocess == "delta" and args.dtype != "uint16":
+        parser.error("--delta supports --dtype uint16 only")
+
+    codec = select_lossless_codec(args)
+    if args.backend is None:
+        args.backend = "dcu" if codec == "mans" else "cpu"
+    if codec == "mans" and args.backend != "dcu":
+        parser.error("the MANS codec runs on the DCU only; use --backend dcu")
+    nbytes = int(np.prod(args.dims)) * np.dtype(args.dtype).itemsize
+    if codec == "mans" and nbytes > MANS_MAX_BYTES:
+        parser.error(f"one MANS stream holds at most 4 GiB of raw data ({nbytes} bytes requested)")
+    if args.codec is None and args.ratio_level is not None:
+        warn("--ratio-level has no effect yet (the default codec lc is used); choose a codec with --codec")
+    if codec == "mans" and args.preprocess == "delta":
+        warn("--delta stores signed differences as uint16 bit patterns, which usually lowers the MANS ratio")
 
 
 def read_raw_array(path: Path, dtype_name: str, dims: list[int]) -> np.ndarray:
@@ -204,8 +240,17 @@ def make_codec_options(args: argparse.Namespace, tensor) -> tuple[str, object, l
     raise ValueError(f"Unsupported lossless codec: {codec!r}.")
 
 
+def warm_up(args: argparse.Namespace, codec: str) -> None:
+    """Initialise the DCU runtime with a tiny untimed call so timings show steady-state speed."""
+    if args.backend != "dcu" or not args.warmup:
+        return
+    sample = np.zeros(4096, dtype=np.uint16)
+    photonzip.decompress(photonzip.compress(sample, codec=codec, backend="dcu"), backend="dcu")
+
+
 def compress_array(args: argparse.Namespace, array: np.ndarray):
     codec, codec_options, codec_params = make_codec_options(args, array)
+    warm_up(args, codec)
     t0 = perf_counter()
     packed = photonzip.compress(array, codec=codec, backend=args.backend, codec_options=codec_options)
     t1 = perf_counter()
@@ -229,8 +274,22 @@ def run_compress(args: argparse.Namespace) -> None:
     print_compress_stats(array.nbytes, elapsed, packed.nbytes)
 
 
+def decompress_backend(args: argparse.Namespace, metadata: dict) -> str:
+    if args.backend is not None:
+        backend = args.backend
+    elif metadata["codec"] == "mans":
+        backend = "dcu"
+    else:
+        backend = metadata.get("backend", "cpu") if dcu_available() else "cpu"
+    if metadata["codec"] == "mans" and (backend != "dcu" or not dcu_available()):
+        raise RuntimeError(f"{args.input} holds MANS data, which can only be decompressed on a DCU build with --backend dcu.")
+    return backend
+
+
 def run_decompress(args: argparse.Namespace) -> None:
     metadata, payload = read_container(args.input)
+    args.backend = decompress_backend(args, metadata)
+    warm_up(args, metadata["codec"])
     packed = _native.compressed_from_bytes(
         metadata["codec"],
         payload,
@@ -274,17 +333,20 @@ def run_roundtrip(args: argparse.Namespace) -> None:
     print_roundtrip_stats(array.nbytes, compress_elapsed, t1 - t0, packed.nbytes, np.array_equal(restored_array, array))
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
-    validate_args(args)
-    if args.mode == "compress":
-        run_compress(args)
-        return
-    if args.mode == "decompress":
-        run_decompress(args)
-        return
-    run_roundtrip(args)
+    try:
+        if args.mode == "compress":
+            run_compress(args)
+        elif args.mode == "decompress":
+            run_decompress(args)
+        else:
+            run_roundtrip(args)
+    except (ValueError, RuntimeError, OSError, _native.PhotonZipError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
