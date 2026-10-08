@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "../dcu_workspace.h"
+
 namespace mans::dcu::ans {
 namespace {
 
@@ -30,21 +32,6 @@ void check_hip(hipError_t status, const char* what) {
         throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(status));
     }
 }
-
-class DeviceBuffer {
-public:
-    DeviceBuffer() = default;
-    DeviceBuffer(const DeviceBuffer&) = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-    ~DeviceBuffer() { if (ptr_) (void)hipFree(ptr_); }
-    void allocate(std::size_t bytes, const char* what) {
-        if (ptr_) { (void)hipFree(ptr_); ptr_ = nullptr; }
-        if (bytes) check_hip(hipMalloc(&ptr_, bytes), what);
-    }
-    void* get() const { return ptr_; }
-private:
-    void* ptr_ = nullptr;
-};
 
 __device__ inline std::uint32_t lane32() {
     return static_cast<std::uint32_t>(threadIdx.x) & 31u;
@@ -76,18 +63,23 @@ struct DirectoryEntry { std::uint32_t lengths; std::uint32_t offset_words; };
 static_assert(sizeof(DirectoryEntry) == kDirectoryEntryBytes, "ANS directory entry size changed");
 
 // [PhotonZip] Per-block shared-memory histogram, merged into the global one; the counts are
-// identical to one global atomicAdd per byte, without the contention on 256 addresses.
+// identical to one global atomicAdd per byte, without the contention on 256 addresses. The
+// grid scales with the input (grid-stride loop), so small inputs still use many CUs.
 constexpr std::uint32_t kHistogramThreads = 256;
-constexpr std::uint32_t kHistogramBytesPerBlock = 64 * 1024;
+constexpr std::uint32_t kHistogramMaxBlocks = 1024;
+
+inline std::uint32_t histogram_grid(std::uint32_t bytes) {
+    const std::uint32_t wanted = (bytes + kHistogramThreads * 16 - 1) / (kHistogramThreads * 16);
+    return std::max(1u, std::min(wanted, kHistogramMaxBlocks));
+}
 
 __global__ __launch_bounds__(kHistogramThreads) void histogram_kernel(const std::uint8_t* input, std::uint32_t bytes,
                                  std::uint32_t* histogram) {
     __shared__ std::uint32_t local[kSymbols];
     for (std::uint32_t s = threadIdx.x; s < kSymbols; s += blockDim.x) local[s] = 0;
     __syncthreads();
-    const std::uint32_t begin = blockIdx.x * kHistogramBytesPerBlock;
-    const std::uint32_t end = min(bytes, begin + kHistogramBytesPerBlock);
-    for (std::uint32_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+    const std::uint32_t stride = gridDim.x * blockDim.x;
+    for (std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < bytes; i += stride) {
         atomicAdd(local + input[i], 1u);
     }
     __syncthreads();
@@ -96,7 +88,16 @@ __global__ __launch_bounds__(kHistogramThreads) void histogram_kernel(const std:
     }
 }
 
-__global__ void normalize_kernel(const std::uint32_t* histogram,
+// [PhotonZip] Parallel replacement for the upstream normalisation, which ran on thread 0 only
+// (insertion sort plus adjustment rounds, ~1.3 ms per call). It computes the same table:
+//  - q[s] uses the same float expression;
+//  - the descending order of the unique keys (q << 16) | s gives each symbol its rank as the
+//    number of larger keys, i.e. the insertion-sort result;
+//  - the positive adjustment adds ceil(diff / apply) to every rank whose symbol id is below
+//    apply, which is what the upstream rounds add one at a time;
+//  - the negative adjustment runs the same rounds, counting probabilities > 1 block-wide;
+//  - cdf is the exclusive prefix sum over symbols; magic/shift use the same per-symbol formula.
+__global__ __launch_bounds__(kSymbols) void normalize_kernel(const std::uint32_t* histogram,
                                  std::uint32_t bytes,
                                  std::uint16_t* probabilities,
                                  std::uint32_t* cdf,
@@ -105,72 +106,73 @@ __global__ void normalize_kernel(const std::uint32_t* histogram,
     __shared__ std::uint32_t q[kSymbols];
     __shared__ std::uint32_t order[kSymbols];
     __shared__ std::uint32_t prefix[kSymbols];
-    const std::uint32_t tid = threadIdx.x;
-    if (tid < kSymbols) {
-        std::uint32_t value = static_cast<std::uint32_t>(
-            static_cast<float>(kProbTotal) * (static_cast<float>(histogram[tid]) / static_cast<float>(bytes)));
-        if (histogram[tid] && value == 0) value = 1;
-        q[tid] = value;
-        order[tid] = tid;
-    }
+    __shared__ std::int32_t total;
+    __shared__ std::int32_t gt_one;
+    const std::uint32_t tid = threadIdx.x;  // one thread per symbol, and per rank
+
+    std::uint32_t value = static_cast<std::uint32_t>(
+        static_cast<float>(kProbTotal) * (static_cast<float>(histogram[tid]) / static_cast<float>(bytes)));
+    if (histogram[tid] && value == 0) value = 1;
+    q[tid] = value;
+    if (tid == 0) total = 0;
     __syncthreads();
 
-    if (tid == 0) {
-        // Match CPU's descending sort of (probability << 16) | symbol.
-        for (std::uint32_t i = 1; i < kSymbols; ++i) {
-            const std::uint32_t symbol = order[i];
-            std::uint32_t j = i;
-            while (j > 0 && ((q[order[j - 1]] << 16) | order[j - 1]) <
-                                ((q[symbol] << 16) | symbol)) {
-                order[j] = order[j - 1];
-                --j;
-            }
-            order[j] = symbol;
+    const std::uint32_t key = (q[tid] << 16) | tid;
+    std::uint32_t rank = 0;
+    for (std::uint32_t s = 0; s < kSymbols; ++s) rank += ((q[s] << 16) | s) > key ? 1u : 0u;
+    order[rank] = tid;
+    atomicAdd(&total, static_cast<std::int32_t>(value));
+    __syncthreads();
+
+    prefix[tid] = q[order[tid]];
+    std::int32_t diff = static_cast<std::int32_t>(kProbTotal) - total;
+    __syncthreads();
+    if (diff > 0) {
+        const std::int32_t apply = min(diff, static_cast<std::int32_t>(kSymbols));
+        const std::int32_t rounds = (diff + apply - 1) / apply;
+        if (order[tid] < static_cast<std::uint32_t>(apply)) prefix[tid] += static_cast<std::uint32_t>(rounds);
+    } else {
+        diff = -diff;
+        while (diff > 0) {  // diff, gt_one and apply are uniform across the block
+            if (tid == 0) gt_one = 0;
+            __syncthreads();
+            if (prefix[tid] > 1) atomicAdd(&gt_one, 1);
+            __syncthreads();
+            const std::int32_t count = gt_one;
+            if (count == 0) break;  // unreachable: a total above kProbTotal needs a value > 1
+            const std::int32_t apply = min(diff, count);
+            const std::int32_t first = count - apply;
+            if (static_cast<std::int32_t>(tid) >= first && static_cast<std::int32_t>(tid) < count) --prefix[tid];
+            diff -= apply;
+            __syncthreads();
         }
-        std::int32_t total = 0;
-        for (std::uint32_t i = 0; i < kSymbols; ++i) {
-            prefix[i] = q[order[i]];
-            total += static_cast<std::int32_t>(prefix[i]);
-        }
-        std::int32_t diff = static_cast<std::int32_t>(kProbTotal) - total;
-        if (diff > 0) {
-            const std::int32_t apply = min(diff, static_cast<std::int32_t>(kSymbols));
-            while (diff > 0) {
-                for (std::uint32_t i = 0; i < kSymbols; ++i) {
-                    if (order[i] < static_cast<std::uint32_t>(apply)) ++prefix[i];
-                }
-                diff -= apply;
-            }
-        } else {
-            diff = -diff;
-            while (diff > 0) {
-                std::int32_t gt_one = 0;
-                for (std::uint32_t i = 0; i < kSymbols; ++i) gt_one += prefix[i] > 1;
-                const std::int32_t apply = min(diff, gt_one);
-                const std::int32_t start = gt_one - apply;
-                for (std::int32_t i = start; i < gt_one; ++i) --prefix[i];
-                diff -= apply;
-            }
-        }
-        for (std::uint32_t i = 0; i < kSymbols; ++i) q[order[i]] = prefix[i];
-        std::uint32_t running = 0;
-        for (std::uint32_t i = 0; i < kSymbols; ++i) {
-            const std::uint32_t p = q[i];
-            prefix[i] = running;
-            probabilities[i] = static_cast<std::uint16_t>(p);
-            cdf[i] = running;
-            running += p;
-            if (p == 0) {
-                magic[i] = 0;
-                shifts[i] = 0;
-            } else {
-                const std::uint32_t shift = 32u - static_cast<std::uint32_t>(__clz(p - 1));
-                const std::uint64_t magic64 = ((std::uint64_t{1} << 32) *
-                    ((std::uint64_t{1} << shift) - p)) / p + 1;
-                magic[i] = static_cast<std::uint32_t>(magic64);
-                shifts[i] = shift;
-            }
-        }
+    }
+    __syncthreads();
+    q[order[tid]] = prefix[tid];
+    __syncthreads();
+
+    // Inclusive scan of q over the symbol index (prefix[] is free again).
+    const std::uint32_t p = q[tid];
+    prefix[tid] = p;
+    __syncthreads();
+    for (std::uint32_t offset = 1; offset < kSymbols; offset <<= 1) {
+        const std::uint32_t add = tid >= offset ? prefix[tid - offset] : 0u;
+        __syncthreads();
+        prefix[tid] += add;
+        __syncthreads();
+    }
+    const std::uint32_t running = prefix[tid] - p;
+    probabilities[tid] = static_cast<std::uint16_t>(p);
+    cdf[tid] = running;
+    if (p == 0) {
+        magic[tid] = 0;
+        shifts[tid] = 0;
+    } else {
+        const std::uint32_t shift = 32u - static_cast<std::uint32_t>(__clz(p - 1));
+        const std::uint64_t magic64 = ((std::uint64_t{1} << 32) *
+            ((std::uint64_t{1} << shift) - p)) / p + 1;
+        magic[tid] = static_cast<std::uint32_t>(magic64);
+        shifts[tid] = shift;
     }
 }
 
@@ -394,90 +396,134 @@ void compress_device(const std::uint8_t* input, std::size_t input_bytes,
         throw std::runtime_error("DCU ANS: too many blocks");
     }
     const std::uint32_t stride_words = kLanes * 2 + (kBlockBytes + kBlockBytes / 4 + 15) / 16 * 8;
-    DeviceBuffer histogram, probabilities, cdf, magic, shifts, scratch, word_counts, prefix, size_device;
-    histogram.allocate(kSymbols * sizeof(std::uint32_t), "DCU ANS histogram allocation");
-    probabilities.allocate(kSymbols * sizeof(std::uint16_t), "DCU ANS probability allocation");
-    cdf.allocate(kSymbols * sizeof(std::uint32_t), "DCU ANS CDF allocation");
-    magic.allocate(kSymbols * sizeof(std::uint32_t), "DCU ANS magic allocation");
-    shifts.allocate(kSymbols * sizeof(std::uint32_t), "DCU ANS shift allocation");
-    scratch.allocate(static_cast<std::size_t>(blocks) * stride_words * 2, "DCU ANS scratch allocation");
-    word_counts.allocate(static_cast<std::size_t>(blocks) * sizeof(std::uint32_t), "DCU ANS lengths allocation");
-    prefix.allocate(static_cast<std::size_t>(blocks + 1) * sizeof(std::uint32_t), "DCU ANS prefix allocation");
-    size_device.allocate(sizeof(std::uint32_t), "DCU ANS size allocation");
-    check_hip(hipMemset(histogram.get(), 0, kSymbols * sizeof(std::uint32_t)), "DCU ANS histogram memset");
-    histogram_kernel<<<(bytes + kHistogramBytesPerBlock - 1) / kHistogramBytesPerBlock, kHistogramThreads>>>(
-        input, bytes, static_cast<std::uint32_t*>(histogram.get()));
-    normalize_kernel<<<1, kSymbols>>>(static_cast<const std::uint32_t*>(histogram.get()), bytes,
-        static_cast<std::uint16_t*>(probabilities.get()), static_cast<std::uint32_t*>(cdf.get()),
-        static_cast<std::uint32_t*>(magic.get()), static_cast<std::uint32_t*>(shifts.get()));
-    encode_blocks_kernel<<<blocks, kLanes>>>(
-        input, bytes, static_cast<const std::uint16_t*>(probabilities.get()),
-        static_cast<const std::uint32_t*>(cdf.get()), static_cast<const std::uint32_t*>(magic.get()),
-        static_cast<const std::uint32_t*>(shifts.get()), stride_words,
-        static_cast<std::uint8_t*>(scratch.get()), static_cast<std::uint32_t*>(word_counts.get()));
-    layout_kernel<<<1, kLayoutThreads>>>(static_cast<const std::uint32_t*>(word_counts.get()),
-        static_cast<const std::uint16_t*>(probabilities.get()), blocks, bytes,
-        static_cast<std::uint32_t*>(prefix.get()), output, static_cast<std::uint32_t*>(size_device.get()));
-    scatter_kernel<<<blocks, kScatterThreads>>>(static_cast<const std::uint8_t*>(scratch.get()),
-        static_cast<const std::uint32_t*>(word_counts.get()),
-        static_cast<const std::uint32_t*>(prefix.get()), blocks, bytes, stride_words, output);
+    // [PhotonZip] Scratch buffers come from a reusable workspace instead of nine hipMalloc calls.
+    WorkspaceLease ws(kAnsPool);
+    auto* histogram = ws->get<std::uint32_t>(0, kSymbols);
+    auto* probabilities = ws->get<std::uint16_t>(1, kSymbols);
+    auto* cdf = ws->get<std::uint32_t>(2, kSymbols);
+    auto* magic = ws->get<std::uint32_t>(3, kSymbols);
+    auto* shifts = ws->get<std::uint32_t>(4, kSymbols);
+    auto* scratch = ws->get<std::uint8_t>(5, static_cast<std::size_t>(blocks) * stride_words * 2);
+    auto* word_counts = ws->get<std::uint32_t>(6, blocks);
+    auto* prefix = ws->get<std::uint32_t>(7, static_cast<std::size_t>(blocks) + 1);
+    auto* size_device = ws->get<std::uint32_t>(8, 1);
+    check_hip(hipMemsetAsync(histogram, 0, kSymbols * sizeof(std::uint32_t), nullptr), "DCU ANS histogram memset");
+    histogram_kernel<<<histogram_grid(bytes), kHistogramThreads>>>(input, bytes, histogram);
+    normalize_kernel<<<1, kSymbols>>>(histogram, bytes, probabilities, cdf, magic, shifts);
+    encode_blocks_kernel<<<blocks, kLanes>>>(input, bytes, probabilities, cdf, magic, shifts,
+        stride_words, scratch, word_counts);
+    layout_kernel<<<1, kLayoutThreads>>>(word_counts, probabilities, blocks, bytes, prefix, output, size_device);
+    scatter_kernel<<<blocks, kScatterThreads>>>(scratch, word_counts, prefix, blocks, bytes, stride_words, output);
     check_hip(hipGetLastError(), "DCU ANS encode launch");
-    check_hip(hipDeviceSynchronize(), "DCU ANS encode synchronize");
     std::uint32_t actual = 0;
-    check_hip(hipMemcpy(&actual, size_device.get(), sizeof(actual), hipMemcpyDeviceToHost), "DCU ANS size D2H");
+    check_hip(hipMemcpy(&actual, size_device, sizeof(actual), hipMemcpyDeviceToHost), "DCU ANS size D2H");
     if (actual > output_capacity) throw std::runtime_error("DCU ANS: encoded stream exceeds output capacity");
     output_bytes = actual;
 }
 
-__global__ void decode_kernel(const std::uint8_t* input, std::uint32_t input_bytes,
-                              std::uint8_t* output, std::uint32_t output_bytes,
-                              std::uint32_t* error) {
+// [PhotonZip] Upstream decode_kernel had lane 0 of *every* CTA validate the whole block
+// directory (O(blocks^2): ~325 ms for 256 MiB) and rebuild the 1024-entry inverse table with an
+// O(256) prefix per symbol. The same checks now run once in validate_kernel (parallel prefix
+// sum over the directory), table_kernel builds the inverse table once, and decode_kernel only
+// copies it to shared memory. Decoding itself is unchanged; a malformed stream still decodes
+// nothing and reports error 1.
+constexpr std::uint32_t kValidateThreads = 1024;
+
+__device__ inline std::uint32_t padded_directory_words(std::uint32_t lengths) {
+    return ((lengths & 0xffffu) + kAlignmentWords - 1) & ~(kAlignmentWords - 1);
+}
+
+__global__ __launch_bounds__(kValidateThreads) void validate_kernel(const std::uint8_t* input,
+                                                                    std::uint32_t input_bytes,
+                                                                    std::uint32_t output_bytes,
+                                                                    std::uint32_t* error) {
+    __shared__ std::uint32_t partial[kValidateThreads];
+    __shared__ std::uint32_t bad;
+    const std::uint32_t tid = threadIdx.x;
+    const auto* header = reinterpret_cast<const Header*>(input);
+    const std::uint32_t blocks = header->num_blocks;
+    const std::uint64_t overhead = std::uint64_t{kHeaderBytes} + kSymbols * 2 +
+        std::uint64_t{blocks} * kWarpStateBytes + std::uint64_t{(blocks + 1) & ~1u} * kDirectoryEntryBytes;
+    if (tid == 0) {
+        const auto* probabilities = reinterpret_cast<const std::uint16_t*>(input + kHeaderBytes);
+        std::uint32_t total = 0;
+        for (std::uint32_t i = 0; i < kSymbols; ++i) total += probabilities[i];
+        bad = header->magic_version != kMagicVersion || header->options != kProbBits ||
+              header->uncompressed_bytes != output_bytes || total != kProbTotal ||
+              blocks != (output_bytes + kBlockBytes - 1) / kBlockBytes ||
+              input_bytes < overhead ||
+              overhead + std::uint64_t{header->compressed_words} * 2 > input_bytes;
+    }
+    __syncthreads();
+    if (bad) {  // uniform; the directory may not even be inside the input
+        if (tid == 0) atomicExch(error, 1u);
+        return;
+    }
+
+    const auto* directory = reinterpret_cast<const DirectoryEntry*>(
+        input + kHeaderBytes + kSymbols * 2 + std::size_t{blocks} * kWarpStateBytes);
+    const std::uint32_t per_thread = (blocks + kValidateThreads - 1) / kValidateThreads;
+    const std::uint32_t begin = min(tid * per_thread, blocks);
+    const std::uint32_t end = min(begin + per_thread, blocks);
+    std::uint32_t local = 0;
+    for (std::uint32_t i = begin; i < end; ++i) {
+        const std::uint32_t expected_size = (i + 1 == blocks) ? output_bytes - i * kBlockBytes : kBlockBytes;
+        if ((directory[i].lengths >> 16) != expected_size) bad = 1;
+        local += padded_directory_words(directory[i].lengths);
+    }
+    partial[tid] = local;
+    __syncthreads();
+    for (std::uint32_t offset = 1; offset < kValidateThreads; offset <<= 1) {  // inclusive scan
+        const std::uint32_t add = tid >= offset ? partial[tid - offset] : 0u;
+        __syncthreads();
+        partial[tid] += add;
+        __syncthreads();
+    }
+    std::uint32_t expected_offset = tid == 0 ? 0u : partial[tid - 1];
+    for (std::uint32_t i = begin; i < end; ++i) {
+        if (directory[i].offset_words != expected_offset) bad = 1;
+        expected_offset += padded_directory_words(directory[i].lengths);
+    }
+    if (tid == kValidateThreads - 1 && partial[tid] != header->compressed_words) bad = 1;
+    __syncthreads();
+    if (tid == 0 && bad) atomicExch(error, 1u);
+}
+
+__global__ __launch_bounds__(kSymbols) void table_kernel(const std::uint8_t* input,
+                                                         std::uint32_t* inverse,
+                                                         const std::uint32_t* error) {
+    if (*error) return;
+    __shared__ std::uint32_t scan[kSymbols];
+    const std::uint32_t symbol = threadIdx.x;
+    const auto* probabilities = reinterpret_cast<const std::uint16_t*>(input + kHeaderBytes);
+    const std::uint32_t pdf = probabilities[symbol];
+    scan[symbol] = pdf;
+    __syncthreads();
+    for (std::uint32_t offset = 1; offset < kSymbols; offset <<= 1) {
+        const std::uint32_t add = symbol >= offset ? scan[symbol - offset] : 0u;
+        __syncthreads();
+        scan[symbol] += add;
+        __syncthreads();
+    }
+    const std::uint32_t cdf = scan[symbol] - pdf;
+    for (std::uint32_t j = 0; j < pdf; ++j) {
+        inverse[cdf + j] = symbol | (pdf << 8) | (j << 20);
+    }
+}
+
+__global__ void decode_kernel(const std::uint8_t* input,
+                              std::uint8_t* output,
+                              const std::uint32_t* inverse_table,
+                              const std::uint32_t* error) {
     const std::uint32_t block = blockIdx.x;
     const std::uint32_t lane = threadIdx.x;
     const auto* header = reinterpret_cast<const Header*>(input);
     const std::uint32_t blocks = header->num_blocks;
-    if (block >= blocks) return;
+    if (block >= blocks || *error) return;
 
     __shared__ std::uint32_t inverse[1u << kProbBits];
-    __shared__ std::uint32_t malformed;
-    if (lane == 0) malformed = 0;
+    for (std::uint32_t i = lane; i < (1u << kProbBits); i += kLanes) inverse[i] = inverse_table[i];
     __syncthreads();
-
-    const auto* probabilities = reinterpret_cast<const std::uint16_t*>(input + kHeaderBytes);
-    for (std::uint32_t symbol = lane; symbol < kSymbols; symbol += kLanes) {
-        const std::uint32_t pdf = probabilities[symbol];
-        std::uint32_t cdf = 0;
-        for (std::uint32_t i = 0; i < symbol; ++i) cdf += probabilities[i];
-        for (std::uint32_t j = 0; j < pdf; ++j) {
-            inverse[cdf + j] = symbol | (pdf << 8) | (j << 20);
-        }
-    }
-    __syncthreads();
-    if (lane == 0) {
-        std::uint32_t total = 0;
-        for (std::uint32_t i = 0; i < kSymbols; ++i) total += probabilities[i];
-        if (header->magic_version != kMagicVersion || header->options != kProbBits ||
-            header->uncompressed_bytes != output_bytes || total != kProbTotal ||
-            blocks != (output_bytes + kBlockBytes - 1) / kBlockBytes) malformed = 1;
-        const std::uint32_t overhead = kHeaderBytes + kSymbols * 2 +
-            blocks * kWarpStateBytes + ((blocks + 1) & ~1u) * kDirectoryEntryBytes;
-        if (input_bytes < overhead || overhead + header->compressed_words * 2 > input_bytes) malformed = 1;
-        const auto* directory = reinterpret_cast<const DirectoryEntry*>(input + kHeaderBytes + kSymbols * 2 + blocks * kWarpStateBytes);
-        std::uint32_t expected_offset = 0;
-        for (std::uint32_t i = 0; i < blocks; ++i) {
-            const std::uint32_t expected_size = (i + 1 == blocks) ? output_bytes - i * kBlockBytes : kBlockBytes;
-            if ((directory[i].lengths >> 16) != expected_size ||
-                (directory[i].lengths & 0xffffu) > 0xffffu ||
-                directory[i].offset_words != expected_offset) malformed = 1;
-            expected_offset += ((directory[i].lengths & 0xffffu) + kAlignmentWords - 1) & ~(kAlignmentWords - 1);
-        }
-        if (expected_offset != header->compressed_words) malformed = 1;
-    }
-    __syncthreads();
-    if (malformed) {
-        if (lane == 0) atomicExch(error, 1u);
-        return;
-    }
 
     const auto* directory = reinterpret_cast<const DirectoryEntry*>(input + kHeaderBytes + kSymbols * 2 + blocks * kWarpStateBytes);
     const auto* states = reinterpret_cast<const std::uint32_t*>(input + kHeaderBytes + kSymbols * 2 + block * kWarpStateBytes);
@@ -546,15 +592,17 @@ void decompress_device(const std::uint8_t* input, std::size_t input_bytes,
     const std::size_t required = overhead + static_cast<std::size_t>(header.compressed_words) * 2;
     if (required > input_bytes || required < overhead) throw std::runtime_error("DCU ANS: truncated or oversized stream");
     if (header.uncompressed_bytes > output_capacity) throw std::runtime_error("DCU ANS: output buffer is too small");
-    DeviceBuffer error;
-    error.allocate(sizeof(std::uint32_t), "DCU ANS decode error allocation");
-    check_hip(hipMemset(error.get(), 0, sizeof(std::uint32_t)), "DCU ANS decode error initialize");
-    decode_kernel<<<header.num_blocks, kLanes>>>(input, static_cast<std::uint32_t>(input_bytes), output,
-        header.uncompressed_bytes, static_cast<std::uint32_t*>(error.get()));
+    WorkspaceLease ws(kAnsPool);
+    auto* error = ws->get<std::uint32_t>(9, 1);
+    auto* inverse = ws->get<std::uint32_t>(10, kProbTotal);
+    check_hip(hipMemsetAsync(error, 0, sizeof(std::uint32_t), nullptr), "DCU ANS decode error initialize");
+    validate_kernel<<<1, kValidateThreads>>>(input, static_cast<std::uint32_t>(input_bytes),
+        header.uncompressed_bytes, error);
+    table_kernel<<<1, kSymbols>>>(input, inverse, error);
+    decode_kernel<<<header.num_blocks, kLanes>>>(input, output, inverse, error);
     check_hip(hipGetLastError(), "DCU ANS decode launch");
-    check_hip(hipDeviceSynchronize(), "DCU ANS decode synchronize");
     std::uint32_t host_error = 0;
-    check_hip(hipMemcpy(&host_error, error.get(), sizeof(host_error), hipMemcpyDeviceToHost), "DCU ANS decode validation result");
+    check_hip(hipMemcpy(&host_error, error, sizeof(host_error), hipMemcpyDeviceToHost), "DCU ANS decode validation result");
     if (host_error) throw std::runtime_error(std::string("DCU ANS: invalid codec1 payload (") + std::to_string(host_error) + ")");
     output_bytes = header.uncompressed_bytes;
 }

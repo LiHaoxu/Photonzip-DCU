@@ -30,6 +30,39 @@ __device__ inline std::size_t flat_index(std::size_t local, std::size_t x0,
                (params.dims >= 2 ? static_cast<std::size_t>(params.ny) : 1);
 }
 
+// [PhotonZip] Walks flat_index() over consecutive local indices without the two 64-bit
+// divisions per element (very slow on DCU/AMD GPUs); each lane visits a contiguous range of
+// local indices, so the position only needs those divisions once. Yields exactly the same
+// q = flat_index(local, ...) sequence.
+struct TileCursor {
+    std::size_t lx, ly, sx, sy, row, plane, q;
+
+    __device__ TileCursor(std::size_t local, std::size_t x0, std::size_t y0, std::size_t z0,
+                          std::size_t sx_, std::size_t sy_, const mans::MansParams& params)
+        : sx(sx_), sy(sy_) {
+        row = static_cast<std::size_t>(params.nx);
+        plane = row * (params.dims >= 2 ? static_cast<std::size_t>(params.ny) : 1);
+        const std::size_t tile_plane = sx * sy;
+        const std::size_t lz = params.dims == 3 ? local / tile_plane : 0;
+        const std::size_t rem = params.dims == 3 ? local - lz * tile_plane : local;
+        ly = rem / sx;
+        lx = rem - ly * sx;
+        q = (x0 + lx) + (y0 + ly) * row + (z0 + lz) * plane;
+    }
+
+    __device__ void next() {
+        ++q;
+        if (++lx == sx) {
+            lx = 0;
+            q += row - sx;
+            if (++ly == sy) {
+                ly = 0;
+                q += plane - sy * row;
+            }
+        }
+    }
+};
+
 template <typename T>
 __device__ inline void store_le(std::uint8_t* dst, T value) {
     using U = std::conditional_t<sizeof(T) == 2, std::uint16_t, std::uint32_t>;
@@ -57,7 +90,13 @@ __device__ inline std::int32_t load_i32_le(const std::uint8_t* src) {
     return static_cast<std::int32_t>(value);
 }
 
-template <typename T>
+// [PhotonZip] kStaged (used for 3D tiles): the 32 lanes first load the whole tile into shared
+// memory in row order (coalesced) and later store the codes the same way. Each lane still
+// processes its own contiguous range of local indices, so the output is unchanged; in 3D those
+// ranges are 128 elements spread over 8 rows, which made the direct global accesses scattered.
+constexpr int kTile3DElements = kTile * kTile * kTile;
+
+template <typename T, bool kStaged>
 __global__ void encode(const T* input, std::size_t num_elements,
                        mans::MansParams params, std::uint8_t* codes,
                        std::uint32_t* flags_words, T* centers,
@@ -76,6 +115,8 @@ __global__ void encode(const T* input, std::size_t num_elements,
     __shared__ unsigned int max_signal_bytes;
     __shared__ unsigned int use_adm;
     __shared__ T center;
+    __shared__ T s_tile[kStaged ? kTile3DElements : 1];
+    __shared__ std::uint8_t s_codes[kStaged ? kTile3DElements : 1];
 
     const int lane = static_cast<int>(threadIdx.x);
     const std::size_t block = static_cast<std::size_t>(blockIdx.x);
@@ -108,12 +149,29 @@ __global__ void encode(const T* input, std::size_t num_elements,
     const std::size_t first = static_cast<std::size_t>(lane) * per_lane;
     const std::size_t last = min(first + per_lane, block_elements);
 
+    // Local index i = (lz * sy + ly) * sx + lx; 32-bit math, tiles hold at most 4096 elements.
+    const auto tile_q = [&](unsigned int i) {
+        const unsigned int r = i / static_cast<unsigned int>(sx);
+        const unsigned int lx = i - r * static_cast<unsigned int>(sx);
+        const unsigned int ly = r % static_cast<unsigned int>(sy);
+        const unsigned int lz = r / static_cast<unsigned int>(sy);
+        return (x0 + lx) + (y0 + ly) * nx + (z0 + lz) * nx * ny;
+    };
+    if constexpr (kStaged) {
+        for (unsigned int i = lane; i < block_elements; i += kWarpSize) {
+            s_tile[i] = input[tile_q(i)];
+            s_codes[i] = 0;
+        }
+        __syncthreads();
+    }
+
     unsigned long long local_sum = 0;
     unsigned long long local_count = 0;
     unsigned long long local_min = ~0ull;
     unsigned long long local_max = 0;
-    for (std::size_t local = first; local < last; ++local) {
-        const T value = input[flat_index(local, x0, y0, z0, sx, sy, params)];
+    TileCursor stats_cursor(first, x0, y0, z0, sx, sy, params);
+    for (std::size_t local = first; local < last; ++local, stats_cursor.next()) {
+        const T value = kStaged ? s_tile[local] : input[stats_cursor.q];
         const unsigned long long wide = static_cast<unsigned long long>(value);
         local_sum += wide;
         ++local_count;
@@ -150,9 +208,10 @@ __global__ void encode(const T* input, std::size_t num_elements,
     for (std::size_t i = 0; i < lane_signal_stride; ++i) signal[i] = 0;
 
     std::size_t signal_bits = 0;
-    for (std::size_t local = first; local < last; ++local) {
-        const std::size_t q = flat_index(local, x0, y0, z0, sx, sy, params);
-        const T value = input[q];
+    TileCursor code_cursor(first, x0, y0, z0, sx, sy, params);
+    for (std::size_t local = first; local < last; ++local, code_cursor.next()) {
+        const std::size_t q = code_cursor.q;
+        const T value = kStaged ? s_tile[local] : input[q];
         if (use_adm == 0) {
             store_le(signal + (local - first) * sizeof(T), value);
             continue;
@@ -164,8 +223,13 @@ __global__ void encode(const T* input, std::size_t num_elements,
         const std::size_t output_bits = value == center ? 1 : (diff + 125) / 126;
         const unsigned long long residual = diff + 126 -
             static_cast<unsigned long long>(output_bits) * 126;
-        codes[q] = value == center ? 1 : static_cast<std::uint8_t>(
+        const std::uint8_t code = value == center ? 1 : static_cast<std::uint8_t>(
             residual * 2 + (value > center ? 0 : 1));
+        if constexpr (kStaged) {
+            s_codes[local] = code;
+        } else {
+            codes[q] = code;
+        }
         signal[signal_bits >> 3] |= static_cast<std::uint8_t>(1u << (7 - (signal_bits & 7)));
         signal_bits += output_bits;
     }
@@ -179,6 +243,12 @@ __global__ void encode(const T* input, std::size_t num_elements,
     if (lane == 0) {
         signal_lengths[block] = use_adm != 0
             ? max_signal_bytes : static_cast<std::uint32_t>(per_lane * sizeof(T));
+    }
+    if constexpr (kStaged) {
+        // RAW blocks keep the zeroed codes already in the device buffer.
+        if (use_adm != 0) {
+            for (unsigned int i = lane; i < block_elements; i += kWarpSize) codes[tile_q(i)] = s_codes[i];
+        }
     }
 }
 
@@ -216,7 +286,7 @@ __global__ void validate_payload(const std::uint8_t* payload,
     }
 }
 
-template <typename T>
+template <typename T, bool kStaged>
 __global__ void decode(const std::uint8_t* payload, std::size_t payload_size,
                        std::size_t num_elements, mans::MansParams params,
                        T* output, std::uint32_t* error) {
@@ -279,9 +349,9 @@ __global__ void decode(const std::uint8_t* payload, std::size_t payload_size,
 
     if (!use_adm) {
         if (lane_length < (last - first) * sizeof(T)) { if (lane == 0) *error = 1; return; }
-        for (std::size_t local = first; local < last; ++local) {
-            output[flat_index(local, x0, y0, z0, sx, sy, params)] =
-                load_le<T>(lane_signal + (local - first) * sizeof(T));
+        TileCursor raw_cursor(first, x0, y0, z0, sx, sy, params);
+        for (std::size_t local = first; local < last; ++local, raw_cursor.next()) {
+            output[raw_cursor.q] = load_le<T>(lane_signal + (local - first) * sizeof(T));
         }
         return;
     }
@@ -289,58 +359,87 @@ __global__ void decode(const std::uint8_t* payload, std::size_t payload_size,
     // A signal is a sequence of value-start bits followed by zero continuation
     // bits. A new one terminates the previous value; the last value terminates
     // at the end of the fixed lane region.
+    //
+    // [PhotonZip] Same decoding and the same error semantics as upstream (only lane 0 reports),
+    // restructured without early returns so that, for 3D tiles (kStaged), all lanes reach the
+    // barriers: codes are loaded into shared memory and the decoded tile is stored in row
+    // order (coalesced) instead of 128 scattered accesses per lane.
     const std::size_t lane_values = last - first;
+    __shared__ T s_tile[kStaged ? kTile3DElements : 1];
+    __shared__ std::uint8_t s_codes[kStaged ? kTile3DElements : 1];
+    const std::size_t row_stride = static_cast<std::size_t>(params.nx);
+    const std::size_t plane_stride = row_stride * (params.dims >= 2 ? static_cast<std::size_t>(params.ny) : 1);
+    const auto tile_q = [&](unsigned int i) {
+        const unsigned int r = i / static_cast<unsigned int>(sx);
+        const unsigned int lx = i - r * static_cast<unsigned int>(sx);
+        const unsigned int ly = r % static_cast<unsigned int>(sy);
+        const unsigned int lz = r / static_cast<unsigned int>(sy);
+        return (x0 + lx) + (y0 + ly) * row_stride + (z0 + lz) * plane_stride;
+    };
+    if constexpr (kStaged) {
+        for (unsigned int i = lane; i < block_elements; i += kWarpSize) s_codes[i] = codes[tile_q(i)];
+        __syncthreads();
+    } else {
+        if (lane_values == 0) return;
+    }
+
+    TileCursor value_cursor(first, x0, y0, z0, sx, sy, params);
     std::size_t value_index = 0;
     std::size_t zero_count = 0;
     bool started = false;
-    for (std::size_t byte = 0; byte < lane_length && value_index < lane_values; ++byte) {
+    const auto emit = [&]() -> bool {
+        const std::uint8_t code = kStaged ? s_codes[first + value_index] : codes[value_cursor.q];
+        const std::uint64_t base = (code & 1u) ? (code - 1u) / 2u : code / 2u;
+        const std::uint64_t diff = base + zero_count * 126;
+        const std::uint64_t c = static_cast<std::uint64_t>(center);
+        const std::uint64_t maxv = sizeof(T) == 2 ? 0xffffull : 0xffffffffull;
+        const bool negative = (code & 1u) != 0;
+        if ((negative && diff > c) || (!negative && diff > maxv - c)) return false;
+        const T value = static_cast<T>(negative ? c - diff : c + diff);
+        if constexpr (kStaged) {
+            s_tile[first + value_index] = value;
+        } else {
+            output[value_cursor.q] = value;
+        }
+        ++value_index;
+        value_cursor.next();
+        return true;
+    };
+
+    bool failed = false;
+    bool stopped = lane_values == 0;  // upstream returned here: done, or failed
+    for (std::size_t byte = 0; !stopped && byte < lane_length && value_index < lane_values; ++byte) {
         for (int bit = 7; bit >= 0; --bit) {
             const bool one = (lane_signal[byte] & (1u << bit)) != 0;
             if (one) {
-                if (started) {
-                    const std::size_t local = first + value_index;
-                    const std::size_t q = flat_index(local, x0, y0, z0, sx, sy, params);
-                    const std::uint8_t code = codes[q];
-                    const std::uint64_t base = (code & 1u) ? (code - 1u) / 2u : code / 2u;
-                    const std::uint64_t diff = base + zero_count * 126;
-                    const std::uint64_t c = static_cast<std::uint64_t>(center);
-                    const std::uint64_t maxv = sizeof(T) == 2 ? 0xffffull : 0xffffffffull;
-                    const bool negative = (code & 1u) != 0;
-                    if ((negative && diff > c) || (!negative && diff > maxv - c)) {
-                        if (lane == 0) *error = 1;
-                        return;
-                    }
-                    output[q] = static_cast<T>(negative ? c - diff : c + diff);
-                    ++value_index;
+                if (started && !emit()) {
+                    failed = stopped = true;
+                    break;
                 }
                 started = true;
                 zero_count = 0;
             } else if (started) {
                 ++zero_count;
             } else {
-                if (lane == 0) *error = 1;
-                return;
+                failed = stopped = true;
+                break;
             }
-            if (value_index == lane_values) return;
+            if (value_index == lane_values) {
+                stopped = true;
+                break;
+            }
         }
     }
-    if (started && value_index < lane_values) {
-        const std::size_t local = first + value_index;
-        const std::size_t q = flat_index(local, x0, y0, z0, sx, sy, params);
-        const std::uint8_t code = codes[q];
-        const std::uint64_t base = (code & 1u) ? (code - 1u) / 2u : code / 2u;
-        const std::uint64_t diff = base + zero_count * 126;
-        const std::uint64_t c = static_cast<std::uint64_t>(center);
-        const std::uint64_t maxv = sizeof(T) == 2 ? 0xffffull : 0xffffffffull;
-        const bool negative = (code & 1u) != 0;
-        if ((negative && diff > c) || (!negative && diff > maxv - c)) {
-            if (lane == 0) *error = 1;
-            return;
-        }
-        output[q] = static_cast<T>(negative ? c - diff : c + diff);
-        ++value_index;
+    if (!stopped) {
+        if (started && value_index < lane_values && !emit()) failed = true;
+        if (!failed && value_index != lane_values) failed = true;
     }
-    if (value_index != lane_values && lane == 0) *error = 1;
+    if (failed && lane == 0) *error = 1;
+
+    if constexpr (kStaged) {
+        __syncthreads();
+        for (unsigned int i = lane; i < block_elements; i += kWarpSize) output[tile_q(i)] = s_tile[i];
+    }
 }
 
 } // namespace mans::dcu::adm::kernel
