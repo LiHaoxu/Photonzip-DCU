@@ -75,10 +75,25 @@ static_assert(sizeof(Header) == kHeaderBytes, "ANS header size changed");
 struct DirectoryEntry { std::uint32_t lengths; std::uint32_t offset_words; };
 static_assert(sizeof(DirectoryEntry) == kDirectoryEntryBytes, "ANS directory entry size changed");
 
-__global__ void histogram_kernel(const std::uint8_t* input, std::uint32_t bytes,
+// [PhotonZip] Per-block shared-memory histogram, merged into the global one; the counts are
+// identical to one global atomicAdd per byte, without the contention on 256 addresses.
+constexpr std::uint32_t kHistogramThreads = 256;
+constexpr std::uint32_t kHistogramBytesPerBlock = 64 * 1024;
+
+__global__ __launch_bounds__(kHistogramThreads) void histogram_kernel(const std::uint8_t* input, std::uint32_t bytes,
                                  std::uint32_t* histogram) {
-    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < bytes) atomicAdd(histogram + input[i], 1u);
+    __shared__ std::uint32_t local[kSymbols];
+    for (std::uint32_t s = threadIdx.x; s < kSymbols; s += blockDim.x) local[s] = 0;
+    __syncthreads();
+    const std::uint32_t begin = blockIdx.x * kHistogramBytesPerBlock;
+    const std::uint32_t end = min(bytes, begin + kHistogramBytesPerBlock);
+    for (std::uint32_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+        atomicAdd(local + input[i], 1u);
+    }
+    __syncthreads();
+    for (std::uint32_t s = threadIdx.x; s < kSymbols; s += blockDim.x) {
+        if (local[s] != 0) atomicAdd(histogram + s, local[s]);
+    }
 }
 
 __global__ void normalize_kernel(const std::uint32_t* histogram,
@@ -249,39 +264,91 @@ __global__ void encode_blocks_kernel(const std::uint8_t* input, std::uint32_t by
     if (lane == 0) word_counts[block] = offset;
 }
 
-__global__ void coalesce_kernel(const std::uint8_t* scratch,
-                                const std::uint32_t* word_counts,
-                                const std::uint16_t* probabilities,
-                                std::uint32_t blocks, std::uint32_t input_bytes,
-                                std::uint32_t stride_words,
-                                std::uint32_t* prefix, std::uint8_t* output,
-                                std::uint32_t* output_size) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        std::uint32_t sum = 0;
-        for (std::uint32_t i = 0; i < blocks; ++i) {
-            prefix[i] = sum;
-            sum += (word_counts[i] + kAlignmentWords - 1) & ~(kAlignmentWords - 1);
-        }
-        const std::uint32_t overhead = kHeaderBytes + kSymbols * 2 +
-            blocks * kWarpStateBytes + ((blocks + 1) & ~1u) * kDirectoryEntryBytes;
+// [PhotonZip] The upstream coalesce_kernel ran on a single thread (<<<1, 1>>>) and copied the
+// whole stream byte by byte, which dominated encode time (~2 s for 16 MB). It is split into
+// layout_kernel (parallel prefix sum + header) and scatter_kernel (one CTA per ANS block).
+// The stream layout is unchanged; the alignment padding after each block's words is now
+// written as zeros instead of copying uninitialised scratch memory.
+constexpr std::uint32_t kLayoutThreads = 1024;
+constexpr std::uint32_t kScatterThreads = 256;
+
+__device__ inline std::uint32_t padded_words(std::uint32_t words) {
+    return (words + kAlignmentWords - 1) & ~(kAlignmentWords - 1);
+}
+
+__device__ inline std::uint32_t stream_overhead(std::uint32_t blocks) {
+    return kHeaderBytes + kSymbols * 2 + blocks * kWarpStateBytes +
+           ((blocks + 1) & ~1u) * kDirectoryEntryBytes;
+}
+
+// DTK limits kernels without __launch_bounds__ to 256 threads per block.
+__global__ __launch_bounds__(kLayoutThreads) void layout_kernel(const std::uint32_t* word_counts,
+                              const std::uint16_t* probabilities,
+                              std::uint32_t blocks, std::uint32_t input_bytes,
+                              std::uint32_t* prefix, std::uint8_t* output,
+                              std::uint32_t* output_size) {
+    __shared__ std::uint32_t partial[kLayoutThreads];
+    const std::uint32_t tid = threadIdx.x;
+    const std::uint32_t per_thread = (blocks + kLayoutThreads - 1) / kLayoutThreads;
+    const std::uint32_t begin = min(tid * per_thread, blocks);
+    const std::uint32_t end = min(begin + per_thread, blocks);
+
+    std::uint32_t local = 0;
+    for (std::uint32_t i = begin; i < end; ++i) local += padded_words(word_counts[i]);
+    partial[tid] = local;
+    __syncthreads();
+    for (std::uint32_t offset = 1; offset < kLayoutThreads; offset <<= 1) {  // inclusive scan
+        const std::uint32_t add = tid >= offset ? partial[tid - offset] : 0u;
+        __syncthreads();
+        partial[tid] += add;
+        __syncthreads();
+    }
+    std::uint32_t running = tid == 0 ? 0u : partial[tid - 1];
+    for (std::uint32_t i = begin; i < end; ++i) {
+        prefix[i] = running;
+        running += padded_words(word_counts[i]);
+    }
+
+    if (tid < kSymbols) {
+        reinterpret_cast<std::uint16_t*>(output + kHeaderBytes)[tid] = probabilities[tid];
+    }
+    if (tid == kLayoutThreads - 1) {
+        const std::uint32_t sum = partial[kLayoutThreads - 1];
         Header header{kMagicVersion, blocks, input_bytes, sum, kProbBits, 0, 0, 0};
         *reinterpret_cast<Header*>(output) = header;
-        *output_size = overhead + sum * 2;
-        auto* probs_out = reinterpret_cast<std::uint16_t*>(output + kHeaderBytes);
-        for (std::uint32_t i = 0; i < kSymbols; ++i) probs_out[i] = probabilities[i];
-        auto* directory = reinterpret_cast<DirectoryEntry*>(output + kHeaderBytes + kSymbols * 2 + blocks * kWarpStateBytes);
-        for (std::uint32_t i = 0; i < blocks; ++i) {
-            directory[i].lengths = ((i + 1 == blocks ? header.uncompressed_bytes - i * kBlockBytes : kBlockBytes) << 16) |
-                                   (word_counts[i] & 0xffffu);
-            directory[i].offset_words = prefix[i];
-            const auto* source = scratch + i * stride_words * 2;
-            auto* states = reinterpret_cast<std::uint32_t*>(output + kHeaderBytes + kSymbols * 2 + i * kWarpStateBytes);
-            const auto* source_states = reinterpret_cast<const std::uint32_t*>(source);
-            for (std::uint32_t lane = 0; lane < kLanes; ++lane) states[lane] = source_states[lane];
-            auto* data = output + overhead + prefix[i] * 2;
-            const std::uint32_t copy_bytes = ((word_counts[i] + kAlignmentWords - 1) & ~(kAlignmentWords - 1)) * 2;
-            for (std::uint32_t b = 0; b < copy_bytes; ++b) data[b] = source[kWarpStateBytes + b];
-        }
+        *output_size = stream_overhead(blocks) + sum * 2;
+    }
+}
+
+__global__ __launch_bounds__(kScatterThreads) void scatter_kernel(const std::uint8_t* scratch,
+                               const std::uint32_t* word_counts,
+                               const std::uint32_t* prefix,
+                               std::uint32_t blocks, std::uint32_t input_bytes,
+                               std::uint32_t stride_words, std::uint8_t* output) {
+    const std::uint32_t i = blockIdx.x;
+    if (i >= blocks) return;
+    const std::uint32_t tid = threadIdx.x;
+    const std::uint32_t words = word_counts[i];
+    const std::uint8_t* source = scratch + static_cast<std::size_t>(i) * stride_words * 2;
+
+    if (tid == 0) {
+        auto* directory = reinterpret_cast<DirectoryEntry*>(
+            output + kHeaderBytes + kSymbols * 2 + static_cast<std::size_t>(blocks) * kWarpStateBytes);
+        const std::uint32_t block_bytes = i + 1 == blocks ? input_bytes - i * kBlockBytes : kBlockBytes;
+        directory[i].lengths = (block_bytes << 16) | (words & 0xffffu);
+        directory[i].offset_words = prefix[i];
+    }
+    if (tid < kLanes) {
+        auto* states = reinterpret_cast<std::uint32_t*>(
+            output + kHeaderBytes + kSymbols * 2 + static_cast<std::size_t>(i) * kWarpStateBytes);
+        states[tid] = reinterpret_cast<const std::uint32_t*>(source)[tid];
+    }
+    const auto* src_words = reinterpret_cast<const std::uint16_t*>(source + kWarpStateBytes);
+    auto* dst_words = reinterpret_cast<std::uint16_t*>(
+        output + stream_overhead(blocks) + static_cast<std::size_t>(prefix[i]) * 2);
+    const std::uint32_t padded = padded_words(words);
+    for (std::uint32_t w = tid; w < padded; w += blockDim.x) {
+        dst_words[w] = w < words ? src_words[w] : std::uint16_t{0};
     }
 }
 
@@ -338,7 +405,8 @@ void compress_device(const std::uint8_t* input, std::size_t input_bytes,
     prefix.allocate(static_cast<std::size_t>(blocks + 1) * sizeof(std::uint32_t), "DCU ANS prefix allocation");
     size_device.allocate(sizeof(std::uint32_t), "DCU ANS size allocation");
     check_hip(hipMemset(histogram.get(), 0, kSymbols * sizeof(std::uint32_t)), "DCU ANS histogram memset");
-    histogram_kernel<<<(bytes + 255) / 256, 256>>>(input, bytes, static_cast<std::uint32_t*>(histogram.get()));
+    histogram_kernel<<<(bytes + kHistogramBytesPerBlock - 1) / kHistogramBytesPerBlock, kHistogramThreads>>>(
+        input, bytes, static_cast<std::uint32_t*>(histogram.get()));
     normalize_kernel<<<1, kSymbols>>>(static_cast<const std::uint32_t*>(histogram.get()), bytes,
         static_cast<std::uint16_t*>(probabilities.get()), static_cast<std::uint32_t*>(cdf.get()),
         static_cast<std::uint32_t*>(magic.get()), static_cast<std::uint32_t*>(shifts.get()));
@@ -347,10 +415,12 @@ void compress_device(const std::uint8_t* input, std::size_t input_bytes,
         static_cast<const std::uint32_t*>(cdf.get()), static_cast<const std::uint32_t*>(magic.get()),
         static_cast<const std::uint32_t*>(shifts.get()), stride_words,
         static_cast<std::uint8_t*>(scratch.get()), static_cast<std::uint32_t*>(word_counts.get()));
-    coalesce_kernel<<<1, 1>>>(static_cast<const std::uint8_t*>(scratch.get()),
-        static_cast<const std::uint32_t*>(word_counts.get()),
-        static_cast<const std::uint16_t*>(probabilities.get()), blocks, bytes, stride_words,
+    layout_kernel<<<1, kLayoutThreads>>>(static_cast<const std::uint32_t*>(word_counts.get()),
+        static_cast<const std::uint16_t*>(probabilities.get()), blocks, bytes,
         static_cast<std::uint32_t*>(prefix.get()), output, static_cast<std::uint32_t*>(size_device.get()));
+    scatter_kernel<<<blocks, kScatterThreads>>>(static_cast<const std::uint8_t*>(scratch.get()),
+        static_cast<const std::uint32_t*>(word_counts.get()),
+        static_cast<const std::uint32_t*>(prefix.get()), blocks, bytes, stride_words, output);
     check_hip(hipGetLastError(), "DCU ANS encode launch");
     check_hip(hipDeviceSynchronize(), "DCU ANS encode synchronize");
     std::uint32_t actual = 0;
