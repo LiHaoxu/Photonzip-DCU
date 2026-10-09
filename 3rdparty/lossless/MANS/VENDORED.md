@@ -16,7 +16,7 @@ interoperable with the CPU backend (`tests/mans_cpu_dcu_cross_test.cpp`).
 ## Local patches
 
 All changes are marked `[PhotonZip]` in the sources. They are performance fixes
-only: on a 19-case corpus (1D/2D/3D, uint16/uint32, 1 element to 256 MiB, skewed,
+plus zero-filling of bytes upstream left uninitialised: on a 19-case corpus (1D/2D/3D, uint16/uint32, 1 element to 256 MiB, skewed,
 constant, sparse and mixed data) the patched encoder produces streams that are
 byte-identical to the unmodified upstream DCU encoder, the upstream MANS
 CPU/DCU test suite passes, and the upstream CPU decoder reads the streams.
@@ -34,6 +34,10 @@ Times are for a 16 MiB uint16 2D input on a Hygon BW (gfx936) unless noted.
   The checks now run once in `validate_kernel`, the table is built once in
   `table_kernel`; a malformed stream still decodes nothing and reports error 1.
 - `histogram_kernel` counts in shared memory with a grid scaled to the input.
+- The block directory is padded to an even number of 8-byte entries; with an odd
+  block count the pad entry was never written and kept whatever the output buffer
+  held, so the same input could give different streams (only those 8 bytes;
+  decoders skip them). `layout_kernel` now writes it as zeros.
 
 `dcu/adm/mapping_uint16.hip`, `dcu/adm/adm_kernel.cuh`
 - ADM encode copied lengths, flags, centers, codes and the 32 B-per-lane signal

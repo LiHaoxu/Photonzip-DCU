@@ -66,11 +66,12 @@ if(PHOTONZIP_ENABLE_DCU)
 
   set(PHOTONZIP_MANS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/lossless/MANS)
 
-  # HIP sources of both codecs. Each translation unit carries its own device code, so a
-  # static library is enough (no relocatable device code needed).
+  # HIP sources of both codecs and of the delta preprocessing. Each translation unit carries
+  # its own device code, so a static library is enough (no relocatable device code needed).
   add_library(photonzip_dcu STATIC
     src/photonzip/core/dcu_runtime.hip
     src/photonzip/codecs/lc/lc_dcu.hip
+    src/photonzip/preprocess/delta_dcu.hip
     ${PHOTONZIP_MANS_DIR}/dcu/mans_dcu.cpp
     ${PHOTONZIP_MANS_DIR}/dcu/adm/mapping_uint16.hip
     ${PHOTONZIP_MANS_DIR}/dcu/ans/dcu_ans.hip
@@ -104,6 +105,7 @@ endif()
 add_library(photonzip_core STATIC
   src/photonzip/core/codec_registry.cpp
   src/photonzip/codecs/lc/lc_codec.cpp
+  src/photonzip/preprocess/delta_cpu.cpp
 )
 
 target_include_directories(photonzip_core

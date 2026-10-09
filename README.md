@@ -21,7 +21,8 @@ and tomography data. It ships two codecs:
 - HDF5 filter plugin `H5Z-MANS` (filter ID `32032`, same as upstream H5Z-MANS).
 
 Both codecs can be combined with the optional global inter-slice delta
-preprocessing (`photonzip.preprocess`).
+preprocessing (`photonzip.preprocess`), which runs on the CPU or, in DCU builds,
+on the DCU, where its output can stay in device memory for the codec.
 
 > **Status:** tested on a Hygon BW DCU (gfx936, 80 CUs) with DTK 26.04, and with
 > DTK 25.04.1 + PyTorch 2.5.1 for device tensors:
@@ -44,6 +45,7 @@ a `PhotonZipArray`, which converts to NumPy with `np.from_dlpack(...)`.
 src/photonzip/core/        codec registry, buffer types, DLPack header, HIP helpers
 src/photonzip/codecs/lc/   LC pipeline (CPU), LC DCU kernels, codec registration
 src/photonzip/codecs/mans/ MANS codec (DCU)
+src/photonzip/preprocess/  inter-slice delta: CPU (OpenMP) and DCU (HIP) kernels
 bindings/python/           pybind11 extension module photonzip._native
 python/photonzip/          Python package (API, LC codec, preprocessing)
 filters/                   HDF5 filter plugins H5Z-LC and H5Z-MANS
@@ -89,6 +91,8 @@ cmake --build build -j
 python3 tests/test_dcu.py --plugins build/bin/plugins
 build/bin/photonzip_dcu_bench data.u2 --dims 8192 1024   # needs a DCU; C-order shape
 build/bin/photonzip_dcu_bench data.u2 --dims 8192 1024 --chunk-rows 512 --parallel 2 4
+# delta on the DCU in front of the codecs (frames of 2048*2048 elements)
+build/bin/photonzip_dcu_bench scan.u2 --dims 100 2048 2048 --delta offset --frame 4194304
 ```
 
 For the HDF5 filters, use a serial, shared HDF5 and make sure h5py links the
@@ -137,6 +141,26 @@ pool works too: 8 threads on one DCU reach 10.0 / 10.1 GB/s for MANS and
 7.9 / 10.7 GB/s for LC on the same data (vs. 2.6 / 2.5 and 2.8 / 2.8 GB/s with
 one thread). The first DCU call in a process also pays ~50 ms of runtime
 start-up; the CLI excludes it from its timings (see `--no-warmup`).
+
+**Delta on the DCU** (100 x 2048 x 2048 uint16 tomography stack, 800 MiB, offset
+encoding for MANS; MANS geometry (2048, R, 2048), see "MANS geometry"):
+
+- The delta kernel takes 1.57 ms (inverse 1.56 ms), ~1.07 TB/s of DCU memory
+  traffic. Device-resident MANS with the delta: 12.5 / 13.5 GB/s, against
+  12.8 / 13.9 GB/s for MANS alone on precomputed differences (ratio 1.479).
+- Host memory in and out, the delta alone costs 0.20 s on the DCU (two PCIe
+  copies), 0.16 s with the OpenMP CPU backend (16 cores) and 2.0 s with NumPy.
+  Keeping its output on the DCU for the codec avoids one of the copies: one Python
+  call (`output_on_dcu=True`, see "Python API") compresses the stack at 3.7 GB/s
+  and decompresses it at 3.6 GB/s, delta included.
+- Host path on 8 DCUs x 2 threads in chunks of 10 frames, delta fused into each
+  chunk (`photonzip_dcu_bench --delta offset --delta-scope ...`), against
+  15.0 / 16.2 GB/s for MANS on precomputed differences with the delta not timed:
+  - `global` (the bytes of the whole-stack delta, ratio 1.509): 14.9 / 11.3 GB/s.
+    Decompression needs two passes, since every chunk starts from the restored
+    last frame of the one before;
+  - `chunk` (the delta restarts in every chunk, chunks decode independently,
+    ratio 1.458): 14.5 / 15.5 GB/s.
 
 ### MANS geometry
 
@@ -190,7 +214,19 @@ restored = invert_delta(np.from_dlpack(photonzip.decompress(packed, backend="cpu
 assert meta["lossless"] and np.array_equal(restored, volume)
 
 payload = packed.to_bytes()
+
+# DCU builds: delta on the DCU, its output left in DCU memory and compressed there, so the
+# raw volume crosses PCIe once; only the compressed stream comes back.
+delta, meta = apply_delta(volume, encoding="offset", backend="dcu", output_on_dcu=True)
+packed = photonzip.compress(delta, codec="mans", backend="dcu").to_host()
+restored = photonzip.decompress(packed.to_device(), backend="dcu")       # stays on the DCU
+restored = invert_delta(restored, meta, output_on_dcu=False)              # NumPy array
 ```
+
+`PhotonZipArray.to_host()` / `to_device()` copy an array (compressed or not)
+between host and DCU memory, `.device` says where it is (`"cpu"` or `"dcu"`),
+and `.reshape(shape)` gives an uncompressed array another shape without a copy,
+e.g. to pick the MANS geometry of a DCU-resident array.
 
 To decompress raw payload bytes, rebuild the array with
 `photonzip._native.compressed_from_bytes("lc", payload, "uint16", shape, "cpu")`
@@ -198,11 +234,26 @@ and pass it to `photonzip.decompress(...)`.
 
 ### Delta preprocessing
 
-`apply_delta(array, encoding="int16")` stores slice 0 as-is and every following
-slice as `clip(x[i] - x[i-1], -32768, 32767)` in a uint16 array. The result is
-lossless iff no difference overflows int16; the returned metadata reports
-`overflow_pixels`, `lossless` and the `encoding`. `invert_delta` restores the
-volume with a running sum modulo 2^16 (metadata without `encoding` means `int16`).
+`apply_delta(array, encoding="int16", backend="auto", output_on_dcu=None)` stores
+slice 0 (along axis 0) as-is and every following slice as
+`clip(x[i] - x[i-1], -32768, 32767)` in a uint16 array. The result is lossless
+iff no difference overflows int16; the returned metadata reports
+`overflow_pixels`, `lossless` and the `encoding`. `invert_delta(array, meta, ...)`
+restores the volume with a running sum modulo 2^16 (metadata without `encoding`
+means `int16`).
+
+All backends produce the same bytes:
+
+| `backend` | runs | input / output |
+|---|---|---|
+| `numpy` | NumPy reference (single thread) | host |
+| `cpu` | C++, OpenMP over the elements of a slice | host |
+| `dcu` | HIP kernel, each DCU thread walks all slices for up to 8 consecutive elements | host or DCU; host input is copied in and the result back unless `output_on_dcu=True` |
+| `auto` (default) | `dcu` for arrays in DCU memory, `cpu` otherwise | |
+
+The DCU kernel parallelises over the elements of one slice, so it suits stacks of
+2-D frames; a 1-D array (one element per slice) runs on a single DCU thread and
+belongs on the CPU.
 
 | `encoding` | stored value | use with |
 |---|---|---|
@@ -241,12 +292,19 @@ Compression levels select the codec and are kept for codecs added later:
 | `--codec` | `lc`, `mans` | forces a codec, overriding the levels |
 | `--backend` | `cpu`, `dcu` | compress: `dcu` for `--codec mans`, else `cpu`; decompress: the backend recorded in the file (`dcu` for MANS) |
 | `--no-warmup` | | include the one-time DCU start-up (~50 ms) in the timings |
+| `--delta-backend` | `cpu`, `dcu`, `numpy` | where `--delta` and its inverse run; default `dcu` when the codec runs on the DCU and the data has 2+ dimensions (the delta output then stays in DCU memory), else `cpu`. The container is the same either way |
 
 `--dims` is the C-order shape (slowest dimension first, 1 to 3 values). Legacy
 aliases `--level`/`--fidelity`, `--speed` and `--ratio` are accepted. Invalid
 arguments exit with status 2, runtime errors with status 1. `--delta` stores the
 differences with the `offset` encoding for MANS and `int16` for LC (see "Delta
 preprocessing").
+
+Throughputs are raw bytes / time. `compress` and `decompress` time the codec
+alone; with `--delta` the CLI also prints `delta` / `inverse_delta` (seconds) and
+`compress_with_delta` / `decompress_with_delta`, which include them. With the DCU
+delta the codec reads its input from (or writes its output to) DCU memory, so the
+host <-> DCU copy of the raw data is counted in the delta time.
 
 The `.pzc` container is `b"PZC1"`, a little-endian uint64 metadata length,
 UTF-8 JSON metadata (`codec`, `backend`, `dtype`, `shape`, `codec_params`,
