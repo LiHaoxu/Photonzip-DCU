@@ -86,6 +86,13 @@ def parse_args() -> argparse.Namespace:
         choices=("none", "delta"),
         help="Global preprocessing applied before compression (default: none).",
     )
+    parser.add_argument(
+        "--delta-backend",
+        choices=("cpu", "dcu", "numpy"),
+        help="Where the delta (and its inverse on decompression) runs. Default: dcu when the codec "
+        "runs on the DCU and the data has 2 or more dimensions (the delta result then stays in DCU "
+        "memory for the codec), cpu otherwise. All choices give the same bytes.",
+    )
     args = parser.parse_args()
     validate_args(parser, args)
     return args
@@ -105,6 +112,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error(f"codec {args.codec!r} is not available in this build (available: {photonzip.list_codecs()})")
     if args.backend == "dcu" and not dcu_available():
         parser.error("--backend dcu needs a DCU build (configure with -DPHOTONZIP_ENABLE_DCU=ON)")
+    if args.delta_backend == "dcu" and not dcu_available():
+        parser.error("--delta-backend dcu needs a DCU build (configure with -DPHOTONZIP_ENABLE_DCU=ON)")
     if args.mode not in ("compress", "roundtrip"):
         return
     if not args.dims:
@@ -182,27 +191,47 @@ def read_container(path: Path) -> tuple[dict, bytes]:
     return metadata, payload
 
 
-def print_compress_stats(nbytes: int, elapsed: float, packed_nbytes: int) -> None:
+# Throughputs are raw bytes / time. "compress" and "decompress" time the codec alone (with the
+# DCU delta, its input or output is already in DCU memory, so the host<->DCU copy of the raw
+# data counts as delta time); the *_with_delta lines add the delta or its inverse.
+def print_delta_stats(label: str, nbytes: int, codec_elapsed: float, delta_elapsed: float | None, backend: str | None) -> None:
+    if delta_elapsed is not None:
+        name = "delta" if label == "compress" else "inverse_delta"
+        print(f"{name}: {delta_elapsed:.4f} s ({backend})")
+        print(f"{label}_with_delta: {nbytes / (codec_elapsed + delta_elapsed) / 1e6:.2f} MB/s")
+
+
+def print_compress_stats(nbytes: int, elapsed: float, packed_nbytes: int, delta_elapsed: float | None = None, delta_backend: str | None = None) -> None:
     print(f"compress: {nbytes / elapsed / 1e6:.2f} MB/s")
+    print_delta_stats("compress", nbytes, elapsed, delta_elapsed, delta_backend)
     print(f"ratio: {nbytes / packed_nbytes:.3f}x")
 
 
-def print_decompress_stats(nbytes: int, elapsed: float) -> None:
+def print_decompress_stats(nbytes: int, elapsed: float, delta_elapsed: float | None = None, delta_backend: str | None = None) -> None:
     print(f"decompress: {nbytes / elapsed / 1e6:.2f} MB/s")
+    print_delta_stats("decompress", nbytes, elapsed, delta_elapsed, delta_backend)
 
 
-def print_roundtrip_stats(nbytes: int, compress_elapsed: float, decompress_elapsed: float, packed_nbytes: int, is_equal: bool) -> None:
-    print(f"compress: {nbytes / compress_elapsed / 1e6:.2f} MB/s")
-    print(f"decompress: {nbytes / decompress_elapsed / 1e6:.2f} MB/s")
-    print(f"ratio: {nbytes / packed_nbytes:.3f}x")
+def print_roundtrip_stats(nbytes: int, compress_elapsed: float, decompress_elapsed: float, packed_nbytes: int, is_equal: bool, delta_elapsed: tuple[float, float] | None = None, delta_backend: str | None = None) -> None:
+    print_compress_stats(nbytes, compress_elapsed, packed_nbytes, delta_elapsed and delta_elapsed[0], delta_backend)
+    print_decompress_stats(nbytes, decompress_elapsed, delta_elapsed and delta_elapsed[1], delta_backend)
     print(f"is_equal: {is_equal}")
 
 
-def prepare_compress_input(args: argparse.Namespace, array: np.ndarray) -> tuple[np.ndarray, dict]:
+def resolve_delta_backend(args: argparse.Namespace, ndim: int) -> str:
+    if args.delta_backend is not None:
+        return args.delta_backend
+    # The DCU kernel parallelises over the elements of a slice, so 1-D data stays on the CPU.
+    return "dcu" if args.backend == "dcu" and ndim >= 2 else "cpu"
+
+
+def prepare_compress_input(args: argparse.Namespace, array: np.ndarray, delta_backend: str | None = None):
     if args.preprocess == "delta":
         # MANS needs order-preserving differences (see photonzip.preprocess.DELTA_ENCODINGS).
         encoding = "offset" if select_lossless_codec(args) == "mans" else "int16"
-        delta_array, preprocess = apply_delta(array, encoding=encoding)
+        # A DCU delta feeding a DCU codec leaves its result in DCU memory: one host->DCU copy.
+        on_dcu = delta_backend == "dcu" and args.backend == "dcu"
+        delta_array, preprocess = apply_delta(array, encoding=encoding, backend=delta_backend, output_on_dcu=on_dcu)
         if not preprocess["lossless"]:
             print(
                 f"delta_overflow_pixels: {preprocess['overflow_pixels']} "
@@ -241,27 +270,56 @@ def make_codec_options(args: argparse.Namespace, tensor) -> tuple[str, object, l
     raise ValueError(f"Unsupported lossless codec: {codec!r}.")
 
 
-def warm_up(args: argparse.Namespace, codec: str) -> None:
-    """Initialise the DCU runtime with a tiny untimed call so timings show steady-state speed."""
-    if args.backend != "dcu" or not args.warmup:
+def warm_up(args: argparse.Namespace, codec: str, delta_backend: str | None = None) -> None:
+    """Initialise the DCU runtime with tiny untimed calls so timings show steady-state speed."""
+    if not args.warmup:
         return
-    sample = np.zeros(4096, dtype=np.uint16)
-    photonzip.decompress(photonzip.compress(sample, codec=codec, backend="dcu"), backend="dcu")
+    if args.backend == "dcu":
+        sample = np.zeros(4096, dtype=np.uint16)
+        photonzip.decompress(photonzip.compress(sample, codec=codec, backend="dcu"), backend="dcu")
+    if delta_backend == "dcu":
+        sample, meta = apply_delta(np.zeros((2, 4096), dtype=np.uint16), backend="dcu")
+        invert_delta(sample, meta, backend="dcu")
 
 
 def compress_array(args: argparse.Namespace, array: np.ndarray):
+    """Delta (if requested) and compression, each timed; the compressed stream ends in host memory."""
     codec, codec_options, codec_params = make_codec_options(args, array)
-    warm_up(args, codec)
+    delta_backend = resolve_delta_backend(args, array.ndim) if args.preprocess == "delta" else None
+    warm_up(args, codec, delta_backend)
     t0 = perf_counter()
-    packed = photonzip.compress(array, codec=codec, backend=args.backend, codec_options=codec_options)
+    compress_input, preprocess = prepare_compress_input(args, array, delta_backend)
     t1 = perf_counter()
-    return codec, packed, codec_params, t1 - t0
+    packed = photonzip.compress(compress_input, codec=codec, backend=args.backend, codec_options=codec_options)
+    if packed.device != "cpu":
+        packed = packed.to_host()
+    t2 = perf_counter()
+    delta_elapsed = t1 - t0 if delta_backend is not None else None
+    return codec, packed, codec_params, preprocess, t2 - t1, delta_elapsed, delta_backend
+
+
+def decompress_array(args: argparse.Namespace, packed, preprocess: dict, ndim: int):
+    """Decompression and inverse delta, each timed; returns the restored host array."""
+    delta_backend = resolve_delta_backend(args, ndim) if preprocess.get("type") == "delta" else None
+    t0 = perf_counter()
+    if delta_backend == "dcu" and args.backend == "dcu":
+        # Decode on the DCU and run the inverse delta there before the single copy back.
+        packed = packed.to_device()
+    restored = photonzip.decompress(packed, backend=args.backend)
+    if delta_backend != "dcu" and restored.device != "cpu":
+        restored = restored.to_host()
+    t1 = perf_counter()
+    if delta_backend is not None:
+        array = invert_delta(restored, preprocess, backend=delta_backend, output_on_dcu=False)
+    else:
+        array = to_host_numpy(restored)
+    t2 = perf_counter()
+    return array, t1 - t0, (t2 - t1 if delta_backend is not None else None), delta_backend
 
 
 def run_compress(args: argparse.Namespace) -> None:
     array = read_raw_array(args.input, args.dtype, args.dims)
-    compress_input, preprocess = prepare_compress_input(args, array)
-    codec, packed, codec_params, elapsed = compress_array(args, compress_input)
+    codec, packed, codec_params, preprocess, elapsed, delta_elapsed, delta_backend = compress_array(args, array)
     write_container(
         args.output,
         codec=codec,
@@ -272,7 +330,7 @@ def run_compress(args: argparse.Namespace) -> None:
         payload=packed.to_bytes(),
         preprocess=preprocess,
     )
-    print_compress_stats(array.nbytes, elapsed, packed.nbytes)
+    print_compress_stats(array.nbytes, elapsed, packed.nbytes, delta_elapsed, delta_backend)
 
 
 def decompress_backend(args: argparse.Namespace, metadata: dict) -> str:
@@ -290,7 +348,11 @@ def decompress_backend(args: argparse.Namespace, metadata: dict) -> str:
 def run_decompress(args: argparse.Namespace) -> None:
     metadata, payload = read_container(args.input)
     args.backend = decompress_backend(args, metadata)
-    warm_up(args, metadata["codec"])
+    preprocess = metadata.get("preprocess") or {"type": "none"}
+    if preprocess.get("type") == "delta":
+        warm_up(args, metadata["codec"], resolve_delta_backend(args, len(metadata["shape"])))
+    else:
+        warm_up(args, metadata["codec"])
     packed = _native.compressed_from_bytes(
         metadata["codec"],
         payload,
@@ -299,28 +361,16 @@ def run_decompress(args: argparse.Namespace) -> None:
         args.backend,
         metadata["codec_params"],
     )
-    t0 = perf_counter()
-    restored = photonzip.decompress(packed, backend=args.backend)
-    t1 = perf_counter()
-    array = to_host_numpy(restored)
-    preprocess = metadata.get("preprocess") or {"type": "none"}
-    if preprocess.get("type") == "delta":
-        array = invert_delta(array, preprocess)
+    array, elapsed, delta_elapsed, delta_backend = decompress_array(args, packed, preprocess, len(metadata["shape"]))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     array.tofile(args.output)
-    print_decompress_stats(array.nbytes, t1 - t0)
+    print_decompress_stats(array.nbytes, elapsed, delta_elapsed, delta_backend)
 
 
 def run_roundtrip(args: argparse.Namespace) -> None:
     array = read_raw_array(args.input, args.dtype, args.dims)
-    compress_input, preprocess = prepare_compress_input(args, array)
-    codec, packed, codec_params, compress_elapsed = compress_array(args, compress_input)
-    t0 = perf_counter()
-    restored = photonzip.decompress(packed, backend=args.backend)
-    t1 = perf_counter()
-    restored_array = to_host_numpy(restored)
-    if preprocess.get("type") == "delta":
-        restored_array = invert_delta(restored_array, preprocess)
+    codec, packed, codec_params, preprocess, compress_elapsed, delta_elapsed, delta_backend = compress_array(args, array)
+    restored_array, decompress_elapsed, inverse_elapsed, _ = decompress_array(args, packed, preprocess, array.ndim)
     write_container(
         args.output,
         codec=codec,
@@ -331,7 +381,11 @@ def run_roundtrip(args: argparse.Namespace) -> None:
         payload=packed.to_bytes(),
         preprocess=preprocess,
     )
-    print_roundtrip_stats(array.nbytes, compress_elapsed, t1 - t0, packed.nbytes, np.array_equal(restored_array, array))
+    print_roundtrip_stats(
+        array.nbytes, compress_elapsed, decompress_elapsed, packed.nbytes,
+        np.array_equal(restored_array.reshape(array.shape), array),
+        (delta_elapsed, inverse_elapsed) if delta_elapsed is not None else None, delta_backend,
+    )
 
 
 def main() -> int:

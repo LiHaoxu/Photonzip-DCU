@@ -5,7 +5,9 @@
 Checks:
   1. LC: DCU payload is byte-identical to the CPU payload; CPU<->DCU cross decode.
   2. LC/MANS: host-memory and (if PyTorch sees the DCU) device-memory round trips.
-  3. HDF5: H5Z-LC and H5Z-MANS round trips (if h5py is installed and --plugins is given).
+  3. Delta preprocessing: numpy, cpu and dcu backends give the same bytes (both encodings,
+     clipped values, 1-D to 4-D), and delta -> MANS/LC -> inverse delta stays on the DCU.
+  4. HDF5: H5Z-LC and H5Z-MANS round trips (if h5py is installed and --plugins is given).
 """
 from __future__ import annotations
 
@@ -82,6 +84,56 @@ def check_device_tensors(photonzip, a: np.ndarray) -> None:
         print(f"  {codec:4s} device-memory round trip OK")
 
 
+def delta_cases(raw: np.ndarray | None) -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(1)
+    out = {
+        "one_slice": rng.integers(0, 65535, (1, 33, 7), dtype=np.uint16),
+        "line_1d": rng.integers(0, 65535, 5000, dtype=np.uint16),
+        "clipping_3d": rng.integers(0, 65535, (9, 31, 67), dtype=np.uint16),  # most differences clip
+        "smooth_3d": (np.cumsum(rng.integers(-3, 4, (32, 128, 128)), axis=0) % 4096).astype(np.uint16),
+        "four_dims": rng.integers(0, 3000, (5, 3, 16, 16), dtype=np.uint16),
+    }
+    if raw is not None and raw.size % (2048 * 2048) == 0:
+        out["file"] = raw.reshape(-1, 2048, 2048)
+    return out
+
+
+def check_delta(photonzip, name: str, a: np.ndarray) -> None:
+    from photonzip.preprocess import apply_delta, invert_delta
+
+    for encoding in ("int16", "offset"):
+        (ref, ref_meta), t_np = timed(lambda: apply_delta(a, encoding, backend="numpy"))
+        times = {"numpy": t_np}
+        for backend in ("cpu", "dcu"):
+            (d, meta), times[backend] = timed(lambda: apply_delta(a, encoding, backend=backend))
+            assert d.dtype == np.uint16 and d.shape == a.shape, f"{name}: {backend} delta has the wrong type"
+            assert np.array_equal(d, ref), f"{name}: {backend} {encoding} delta differs from numpy"
+            assert meta == ref_meta, f"{name}: {backend} metadata differs: {meta} vs {ref_meta}"
+            inv = invert_delta(d, meta, backend=backend)
+            assert np.array_equal(inv, invert_delta(ref, ref_meta, backend="numpy")), f"{name}: {backend} inverse differs"
+            if meta["lossless"]:
+                assert np.array_equal(inv, a), f"{name}: {backend} {encoding} round trip mismatch"
+        if a.ndim >= 2:
+            # Device-resident pipeline: one host->DCU copy in, compressed stream out.
+            on_dcu, meta = apply_delta(a, encoding, backend="dcu", output_on_dcu=True)
+            assert on_dcu.device == "dcu" and list(on_dcu.shape) == list(a.shape)
+            if a.ndim <= 3:
+                codec = "mans" if encoding == "offset" else "lc"
+                packed = photonzip.compress(on_dcu, codec=codec, backend="dcu")
+                assert packed.to_bytes() == photonzip.compress(ref, codec=codec, backend="dcu").to_bytes(), \
+                    f"{name}: {codec} stream of the DCU-resident delta differs"
+                restored = photonzip.decompress(packed.to_host().to_device(), backend="dcu")
+                assert restored.device == "dcu"
+                back = invert_delta(restored, meta, output_on_dcu=False)
+                assert np.array_equal(back, invert_delta(ref, ref_meta)), f"{name}: DCU pipeline mismatch"
+        print(f"  delta {name:12s} {encoding:6s} clipped {ref_meta['overflow_pixels']:9d}  "
+              + "  ".join(f"{k} {v * 1e3:8.2f} ms" for k, v in times.items()) + "  OK")
+    # Files written before the "encoding" field existed decode as int16.
+    legacy = {k: v for k, v in apply_delta(a, "int16", backend="numpy")[1].items() if k != "encoding"}
+    assert np.array_equal(invert_delta(apply_delta(a, "int16")[0], legacy, backend="dcu"),
+                          invert_delta(apply_delta(a, "int16")[0], legacy, backend="numpy"))
+
+
 def check_hdf5(plugins: str, a: np.ndarray) -> None:
     os.environ["HDF5_PLUGIN_PATH"] = plugins
     try:
@@ -130,6 +182,10 @@ def main() -> int:
 
     print("Device memory:")
     check_device_tensors(photonzip, cases(None)["smooth_3d"])
+
+    print("Delta preprocessing (numpy / cpu / dcu backends):")
+    for name, a in delta_cases(raw).items():
+        check_delta(photonzip, name, a)
 
     if args.plugins:
         print("HDF5 filters:")

@@ -314,6 +314,14 @@ __global__ __launch_bounds__(kLayoutThreads) void layout_kernel(const std::uint3
     if (tid < kSymbols) {
         reinterpret_cast<std::uint16_t*>(output + kHeaderBytes)[tid] = probabilities[tid];
     }
+    if (tid == 0 && (blocks & 1u)) {
+        // [PhotonZip] The directory is padded to an even number of entries. scatter_kernel
+        // writes one entry per block, so the pad entry used to keep whatever the output buffer
+        // held before: the stream then depended on the buffer's history (decoders skip it).
+        auto* directory = reinterpret_cast<DirectoryEntry*>(
+            output + kHeaderBytes + kSymbols * 2 + static_cast<std::size_t>(blocks) * kWarpStateBytes);
+        directory[blocks] = DirectoryEntry{0u, 0u};
+    }
     if (tid == kLayoutThreads - 1) {
         const std::uint32_t sum = partial[kLayoutThreads - 1];
         Header header{kMagicVersion, blocks, input_bytes, sum, kProbBits, 0, 0, 0};

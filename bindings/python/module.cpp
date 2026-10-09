@@ -1,3 +1,4 @@
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -6,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,6 +16,7 @@
 #include "photonzip/core/codec_registry.hpp"
 #include "photonzip/core/codec_types.hpp"
 #include "photonzip/core/errors.hpp"
+#include "photonzip/preprocess/delta.hpp"
 #ifdef PHOTONZIP_ENABLE_DCU
 #include "photonzip/core/dcu_runtime.hpp"
 #endif
@@ -399,7 +402,8 @@ std::shared_ptr<PhotonZipArrayState> make_uncompressed_state(const PhotonZipArra
   auto state = std::make_shared<PhotonZipArrayState>();
   state->buffer = std::move(buffer);
   state->logical = compressed.state().original;
-  state->original = compressed.state().original;
+  state->logical.memory_kind = state->buffer.memory_kind;
+  state->original = state->logical;
   state->codec_name = compressed.state().codec_name;
   state->backend = compressed.state().backend;
   state->codec_params = compressed.state().codec_params;
@@ -540,6 +544,196 @@ PhotonZipArray compressed_from_bytes(const std::string& codec_name,
   return PhotonZipArray(make_compressed_state(codec_name, options, std::move(buffer)));
 }
 
+// ---- Delta preprocessing (photonzip/preprocess/delta.hpp) ----
+
+delta::Encoding parse_delta_encoding(const std::string& value) {
+  if (value == "int16") {
+    return delta::Encoding::kInt16;
+  }
+  if (value == "offset") {
+    return delta::Encoding::kOffset;
+  }
+  throw Error("Unknown delta encoding: " + value + " (expected int16 or offset).");
+}
+
+// Plain (uncompressed) uint16 array state for delta results.
+std::shared_ptr<PhotonZipArrayState> make_plain_state(Buffer buffer, std::vector<std::int64_t> shape) {
+  auto state = std::make_shared<PhotonZipArrayState>();
+  state->buffer = std::move(buffer);
+  state->logical.dtype = DataType::kUInt16;
+  state->logical.memory_kind = state->buffer.memory_kind;
+  state->logical.shape = std::move(shape);
+  state->original = state->logical;
+  state->backend = state->buffer.memory_kind == MemoryKind::kDcu ? Backend::kDcu : Backend::kCpu;
+  return state;
+}
+
+// Writable NumPy array that owns `buffer` (host memory), without a copy.
+py::array numpy_from_buffer(Buffer buffer, const std::vector<std::int64_t>& shape) {
+  auto* owner = new Buffer(std::move(buffer));
+  py::capsule base(owner, [](void* p) { delete static_cast<Buffer*>(p); });
+  const std::vector<py::ssize_t> dims(shape.begin(), shape.end());
+  return py::array_t<std::uint16_t>(dims, reinterpret_cast<std::uint16_t*>(owner->mutable_bytes()), base);
+}
+
+// The delta runs along axis 0: frames = shape[0], each holding the remaining elements.
+// NumPy input goes through the buffer protocol (read-only arrays are fine); anything else,
+// e.g. a PhotonZipArray or a PyTorch tensor in DCU memory, through DLPack. The result goes to
+// DCU memory if output_on_dcu (default: where the input is): a PhotonZipArray there, a
+// writable NumPy array in host memory.
+std::pair<py::object, std::uint64_t> run_delta(py::object input, const std::string& encoding_name,
+                                               const std::string& backend_name,
+                                               std::optional<bool> output_on_dcu, bool decode) {
+  InputBuffer in;
+  std::vector<std::int64_t> shape;
+  std::optional<ManagedDLPackTensor> managed_tensor;  // keeps a DLPack input alive
+  if (py::isinstance<py::array>(input)) {
+    const auto array = py::reinterpret_borrow<py::array>(input);
+    if (!py::isinstance<py::array_t<std::uint16_t>>(input)) {
+      throw Error("Delta preprocessing supports uint16 arrays only.");
+    }
+    if (!(array.flags() & py::array::c_style) || array.ndim() < 1 || array.size() == 0) {
+      throw Error("Delta preprocessing needs a non-empty C-contiguous array.");
+    }
+    in.data = array.data();
+    in.size = static_cast<std::size_t>(array.nbytes());
+    in.memory_kind = MemoryKind::kHost;
+    shape.assign(array.shape(), array.shape() + array.ndim());
+  } else {
+    managed_tensor.emplace(input);
+    const auto& tensor = managed_tensor->tensor();
+    if (parse_dtype(tensor.dtype) != DataType::kUInt16) {
+      throw Error("Delta preprocessing supports uint16 tensors only.");
+    }
+    in = make_input_buffer(tensor);
+    shape.assign(tensor.shape, tensor.shape + tensor.ndim);
+  }
+  const auto encoding = parse_delta_encoding(encoding_name);
+  const bool input_on_dcu = in.memory_kind == MemoryKind::kDcu;
+  if (in.memory_kind == MemoryKind::kCuda) {
+    throw Error("Delta preprocessing does not support CUDA tensors.");
+  }
+  const Backend backend = parse_backend(backend_name, input_on_dcu ? Backend::kDcu : Backend::kCpu);
+  const bool to_dcu = output_on_dcu.value_or(input_on_dcu);
+  if (backend == Backend::kCuda) {
+    throw Error("Delta preprocessing has no CUDA backend.");
+  }
+  if (backend == Backend::kCpu && (input_on_dcu || to_dcu)) {
+    throw Error("The cpu delta backend works on host memory only; use backend='dcu'.");
+  }
+#ifndef PHOTONZIP_ENABLE_DCU
+  if (backend == Backend::kDcu) {
+    throw Error("This PhotonZip build has no DCU backend (configure with -DPHOTONZIP_ENABLE_DCU=ON).");
+  }
+#endif
+
+  const std::size_t frames = static_cast<std::size_t>(shape[0]);
+  const std::size_t frame_elems = in.size / sizeof(std::uint16_t) / frames;
+  const auto* src = static_cast<const std::uint16_t*>(in.data);
+
+  Buffer output;
+  std::uint64_t clipped = 0;
+  {
+    py::gil_scoped_release release;
+    if (backend == Backend::kCpu) {
+      output = make_host_buffer(in.size);
+      auto* dst = reinterpret_cast<std::uint16_t*>(output.mutable_bytes());
+      if (decode) {
+        delta::decode_host(src, dst, frames, frame_elems, encoding);
+      } else {
+        clipped = delta::encode_host(src, dst, frames, frame_elems, encoding);
+      }
+    } else {
+#ifdef PHOTONZIP_ENABLE_DCU
+      // Host input is copied to the DCU and transformed in place there; device input is read
+      // where it is and never modified.
+      Buffer device = dcu::make_device_buffer(in.size);
+      auto* d_out = reinterpret_cast<std::uint16_t*>(device.mutable_bytes());
+      const std::uint16_t* d_in = src;
+      if (!input_on_dcu) {
+        dcu::copy_host_to_device(d_out, src, in.size);
+        d_in = d_out;
+      }
+      if (decode) {
+        delta::decode_device(d_in, d_out, frames, frame_elems, encoding);
+      } else {
+        clipped = delta::encode_device(d_in, d_out, frames, frame_elems, encoding);
+      }
+      if (to_dcu) {
+        output = std::move(device);
+      } else {
+        output = make_host_buffer(in.size);
+        dcu::copy_device_to_host(output.mutable_bytes(), d_out, in.size);
+      }
+#endif
+    }
+  }
+  if (output.memory_kind == MemoryKind::kHost) {
+    return {numpy_from_buffer(std::move(output), shape), clipped};
+  }
+  return {py::cast(PhotonZipArray(make_plain_state(std::move(output), std::move(shape)))), clipped};
+}
+
+// Copy of `array` (compressed or not) in host or DCU memory; the metadata is unchanged.
+PhotonZipArray copy_to_memory(const PhotonZipArray& array, MemoryKind target) {
+  const auto& state = array.state();
+  if (state.buffer.memory_kind == target) {
+    return array;
+  }
+  auto copy = std::make_shared<PhotonZipArrayState>(state);
+  const std::size_t size = state.buffer.size;
+  {
+    py::gil_scoped_release release;
+    if (target == MemoryKind::kHost && state.buffer.memory_kind == MemoryKind::kDcu) {
+#ifdef PHOTONZIP_ENABLE_DCU
+      copy->buffer = make_host_buffer(size);
+      dcu::copy_device_to_host(copy->buffer.mutable_bytes(), state.buffer.bytes(), size);
+#else
+      throw Error("This PhotonZip build has no DCU backend.");
+#endif
+    } else if (target == MemoryKind::kDcu && state.buffer.memory_kind == MemoryKind::kHost) {
+#ifdef PHOTONZIP_ENABLE_DCU
+      copy->buffer = dcu::make_device_buffer(size);
+      dcu::copy_host_to_device(copy->buffer.mutable_bytes(), state.buffer.bytes(), size);
+#else
+      throw Error("This PhotonZip build has no DCU backend (configure with -DPHOTONZIP_ENABLE_DCU=ON).");
+#endif
+    } else {
+      throw Error("Unsupported memory kind for to_host/to_device.");
+    }
+  }
+  copy->buffer.size = size;
+  copy->logical.memory_kind = target;
+  copy->original.memory_kind = target;
+  return PhotonZipArray(copy);
+}
+
+// The same uncompressed data viewed with another shape (no copy).
+PhotonZipArray reshape_array(const PhotonZipArray& array, const std::vector<std::int64_t>& shape) {
+  const auto& state = array.state();
+  if (state.compressed) {
+    throw Error("reshape applies to uncompressed arrays only.");
+  }
+  std::size_t elements = 1;
+  for (const auto dim : shape) {
+    if (dim <= 0) {
+      throw Error("reshape needs positive dimensions.");
+    }
+    elements = checked_product(elements, static_cast<std::size_t>(dim), "reshape element count");
+  }
+  std::size_t current = 1;
+  for (const auto dim : state.logical.shape) {
+    current *= static_cast<std::size_t>(dim);
+  }
+  if (elements != current) {
+    throw Error("reshape must keep the number of elements.");
+  }
+  auto view = std::make_shared<PhotonZipArrayState>(state);
+  view->logical.shape = shape;
+  view->original.shape = shape;
+  return PhotonZipArray(view);
+}
+
 py::object invoke_codec(const std::string& codec_name,
                         const std::string& op_name,
                         py::object request) {
@@ -589,6 +783,16 @@ PYBIND11_MODULE(_native, module) {
       .def("to_bytes", [](const photonzip::PhotonZipArray& array) {
         return photonzip::buffer_to_py_bytes(array.state().buffer);
       })
+      .def_property_readonly("device", [](const photonzip::PhotonZipArray& array) {
+        return array.state().buffer.memory_kind == photonzip::MemoryKind::kDcu ? "dcu" : "cpu";
+      })
+      .def("to_host", [](const photonzip::PhotonZipArray& array) {
+        return photonzip::copy_to_memory(array, photonzip::MemoryKind::kHost);
+      })
+      .def("to_device", [](const photonzip::PhotonZipArray& array) {
+        return photonzip::copy_to_memory(array, photonzip::MemoryKind::kDcu);
+      })
+      .def("reshape", &photonzip::reshape_array, py::arg("shape"))
       .def("__dlpack__",
            [](const photonzip::PhotonZipArray& array, py::args args, py::kwargs kwargs) {
              (void)args;
@@ -622,6 +826,29 @@ PYBIND11_MODULE(_native, module) {
       py::arg("shape"),
       py::arg("backend"),
       py::arg("codec_params") = std::vector<std::uint32_t>{});
+  module.def(
+      "delta_encode",
+      [](py::object input, const std::string& encoding, const std::string& backend,
+         std::optional<bool> output_on_dcu) {
+        auto [array, clipped] = photonzip::run_delta(std::move(input), encoding, backend, output_on_dcu, false);
+        return py::make_tuple(array, static_cast<unsigned long long>(clipped));
+      },
+      py::arg("input"),
+      py::arg("encoding"),
+      py::arg("backend") = "auto",
+      py::arg("output_on_dcu") = py::none(),
+      "Inter-frame delta along axis 0 of a uint16 tensor; returns (array, clipped_elements).");
+  module.def(
+      "delta_decode",
+      [](py::object input, const std::string& encoding, const std::string& backend,
+         std::optional<bool> output_on_dcu) {
+        return photonzip::run_delta(std::move(input), encoding, backend, output_on_dcu, true).first;
+      },
+      py::arg("input"),
+      py::arg("encoding"),
+      py::arg("backend") = "auto",
+      py::arg("output_on_dcu") = py::none(),
+      "Inverse of delta_encode.");
   module.def(
       "invoke_codec",
       &photonzip::invoke_codec,
