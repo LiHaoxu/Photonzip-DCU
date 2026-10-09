@@ -93,6 +93,8 @@ build/bin/photonzip_dcu_bench data.u2 --dims 8192 1024   # needs a DCU; C-order 
 build/bin/photonzip_dcu_bench data.u2 --dims 8192 1024 --chunk-rows 512 --parallel 2 4
 # delta on the DCU in front of the codecs (frames of 2048*2048 elements)
 build/bin/photonzip_dcu_bench scan.u2 --dims 100 2048 2048 --delta offset --frame 4194304
+# chunks of 10 frames kept in DCU memory, 4 threads on one DCU: kernels only, no PCIe
+build/bin/photonzip_dcu_bench scan.u2 --dims 100 2048 2048 --chunk-rows 10 --resident --host-only --parallel 1 4
 ```
 
 For the HDF5 filters, use a serial, shared HDF5 and make sure h5py links the

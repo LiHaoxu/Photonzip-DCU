@@ -3,7 +3,7 @@
 //   photonzip_dcu_bench <raw file> [--dtype u16|u32] [--dims d0 [d1 [d2]]] [--iters N]
 //                       [--dump PREFIX]   (writes PREFIX.lc, PREFIX.mans, PREFIX.delta and, for
 //                                          host-memory runs, PREFIX.<codec>.chunks)
-//                       [--only lc|mans] [--chunk-rows R [--parallel D T] [--host-only]]
+//                       [--only lc|mans] [--chunk-rows R [--parallel D T] [--host-only] [--resident]]
 //                       [--delta int16|offset [--frame E] [--delta-scope global|chunk]]
 //
 // --dims is the C-order shape (slowest dimension first, as in NumPy/HDF5); MANS receives the
@@ -11,7 +11,9 @@
 // --chunk-rows R also times the host-memory API (host in, host out, as used by Python and
 // the HDF5 filters) on chunks of R slices along the first dimension, one call per chunk.
 // --parallel D T spreads those chunks over D DCUs with T host threads per DCU, and
-// --host-only skips the whole-array device-resident runs.
+// --host-only skips the whole-array device-resident runs. --resident keeps the chunked runs
+// in DCU memory instead (one DCU, T threads on it): the same chunks, threads and delta, but
+// no host<->DCU copies in the timings, so they show the kernels alone (see run_resident).
 // --delta runs the inter-frame delta (photonzip/preprocess/delta.hpp) on the DCU in front of
 // the codecs, frames of E elements (default: one slice of the first dimension), on raw u16
 // input. Device-resident runs time the delta kernels alone and delta + codec on the whole
@@ -257,6 +259,86 @@ FusedResult run_fused_delta(const std::vector<std::uint8_t>& host,
   return result;
 }
 
+// The chunked runs of run_fused_delta with the data already in DCU memory: one DCU, T host
+// threads on it (each with its own default stream), no host<->DCU copies in the timings.
+// Without delta the codec reads the chunks of d_input in place. With it, each chunk's delta
+// goes to a per-thread scratch buffer first; in the global scope the frame before the chunk
+// is read straight from d_input, and decompression chains the chunk sums on the DCU (a
+// one-frame decode adds two frames) before restoring the chunks in parallel.
+FusedResult run_resident(const void* d_input, const std::vector<std::uint8_t>& host,
+                         const std::vector<std::pair<std::size_t, std::size_t>>& chunk_list,
+                         std::size_t row_elems, std::size_t width, bool use_delta, std::size_t frame_elems,
+                         photonzip::delta::Encoding encoding, bool global, int threads, int iters,
+                         const DeviceCodec& codec) {
+  namespace delta = photonzip::delta;
+  const std::size_t chunks = chunk_list.size();
+  auto offset_of = [&](std::size_t c) { return chunk_list[c].first * row_elems * width; };
+  auto bytes_of = [&](std::size_t c) { return chunk_list[c].second * row_elems * width; };
+  auto frames_of = [&](std::size_t c) { return chunk_list[c].second * row_elems / frame_elems; };
+  const auto* input = static_cast<const std::uint8_t*>(d_input);
+
+  std::size_t max_bytes = 0;
+  for (std::size_t c = 0; c < chunks; ++c) max_bytes = std::max(max_bytes, bytes_of(c));
+  std::vector<std::unique_ptr<DeviceBuffer>> d_packed(chunks), d_scratch(threads), d_sum(chunks), d_carry(chunks);
+  for (auto& buffer : d_packed) buffer.reset(new DeviceBuffer(codec.capacity));
+  if (use_delta) {
+    for (auto& buffer : d_scratch) buffer.reset(new DeviceBuffer(max_bytes));
+    for (std::size_t c = 1; global && c < chunks; ++c) {
+      d_sum[c].reset(new DeviceBuffer(frame_elems * sizeof(std::uint16_t)));
+      d_carry[c].reset(new DeviceBuffer(frame_elems * sizeof(std::uint16_t)));
+    }
+  }
+  DeviceBuffer d_restored(host.size());
+  auto* restored = d_restored.as<std::uint8_t>();
+  std::vector<std::size_t> sizes(chunks);
+
+  FusedResult result;
+  result.compress_s = time_median(iters, [&] {
+    for_chunks(chunks, 1, threads, [&](std::size_t c) {
+      const void* source = input + offset_of(c);
+      if (use_delta) {
+        const auto* chunk = reinterpret_cast<const std::uint16_t*>(input + offset_of(c));
+        auto* scratch = d_scratch[c % threads]->as<std::uint16_t>();
+        delta::encode_device(chunk, scratch, frames_of(c), frame_elems, encoding,
+                             global && c > 0 ? chunk - frame_elems : nullptr);
+        source = scratch;
+      }
+      sizes[c] = codec.compress(c, source, d_packed[c]->ptr);
+    });
+  });
+  for (const auto size : sizes) result.packed += size;
+
+  // Restored frame before chunk c >= 1: the last frame of chunk 0, then carry[c-1] + sum[c-1].
+  auto before = [&](std::size_t c) -> const std::uint16_t* {
+    if (c == 1) return reinterpret_cast<const std::uint16_t*>(restored + offset_of(1)) - frame_elems;
+    return d_carry[c]->as<std::uint16_t>();
+  };
+  result.decompress_s = time_median(iters, [&] {
+    for_chunks(chunks, 1, threads, [&](std::size_t c) {
+      auto* chunk = reinterpret_cast<std::uint16_t*>(restored + offset_of(c));
+      codec.decompress(c, d_packed[c]->ptr, sizes[c], chunk);
+      if (!use_delta) return;
+      if (!global || c == 0) {
+        delta::decode_device(chunk, chunk, frames_of(c), frame_elems, encoding);
+      } else if (c + 1 < chunks) {  // the last chunk's sum is not needed
+        delta::frame_sum_device(chunk, d_sum[c]->as<std::uint16_t>(), frames_of(c), frame_elems, encoding);
+      }
+    });
+    if (!use_delta || !global || chunks < 2) return;
+    for (std::size_t c = 2; c < chunks; ++c) {
+      delta::decode_device(d_sum[c - 1]->as<std::uint16_t>(), d_carry[c]->as<std::uint16_t>(), 1, frame_elems,
+                           delta::Encoding::kInt16, before(c - 1));
+    }
+    for_chunks(chunks, 1, threads, [&](std::size_t c) {
+      if (c == 0) return;
+      auto* chunk = reinterpret_cast<std::uint16_t*>(restored + offset_of(c));
+      delta::decode_device(chunk, chunk, frames_of(c), frame_elems, encoding, before(c));
+    });
+  });
+  result.ok = same_on_host(restored, host, host.size());
+  return result;
+}
+
 void report(const char* name, std::size_t raw, std::size_t packed, double tc, double td, bool ok) {
   std::printf("%-10s ratio %8.3f  compress %8.2f GB/s  decompress %8.2f GB/s  %s\n", name,
               packed ? double(raw) / double(packed) : 0.0, tc > 0 ? raw / tc / 1e9 : 0.0,
@@ -268,7 +350,7 @@ void report(const char* name, std::size_t raw, std::size_t packed, double tc, do
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr, "usage: %s <raw file> [--dtype u16|u32] [--dims d0 [d1 [d2]]] [--iters N] "
-                         "[--dump PREFIX] [--only lc|mans] [--chunk-rows R [--parallel D T] [--host-only]] "
+                         "[--dump PREFIX] [--only lc|mans] [--chunk-rows R [--parallel D T] [--host-only] [--resident]] "
                          "[--delta int16|offset [--frame E] [--delta-scope global|chunk]]\n", argv[0]);
     return 2;
   }
@@ -280,6 +362,7 @@ int main(int argc, char** argv) {
   std::size_t chunk_rows = 0;
   int par_devices = 1, par_threads = 1;
   bool host_only = false;
+  bool resident = false;
   std::string delta_name;
   std::size_t frame_elems = 0;
   bool delta_global = true;
@@ -293,6 +376,8 @@ int main(int argc, char** argv) {
       only = argv[++i];
     } else if (arg == "--host-only") {
       host_only = true;
+    } else if (arg == "--resident") {
+      resident = true;
     } else if (arg == "--parallel" && i + 2 < argc) {
       par_devices = std::max(1, std::atoi(argv[++i]));
       par_threads = std::max(1, std::atoi(argv[++i]));
@@ -360,8 +445,13 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--parallel asks for %d DCUs but %d are visible\n", par_devices, device_count);
     return 2;
   }
+  if (resident && par_devices != 1) {
+    std::fprintf(stderr, "--resident runs on one DCU: use --parallel 1 T\n");
+    return 2;
+  }
   if (chunk_rows) {
-    std::printf("host-memory runs: %zu chunks of up to %zu bytes on %d DCU(s) x %d thread(s)\n", chunk_list.size(),
+    std::printf("%s runs: %zu chunks of up to %zu bytes on %d DCU(s) x %d thread(s)\n",
+                resident ? "DCU-resident chunked" : "host-memory", chunk_list.size(),
                 rows_per_chunk * row_elems * width, par_devices, par_threads);
   }
   const std::size_t max_chunk_bytes = rows_per_chunk * row_elems * width;
@@ -449,17 +539,21 @@ int main(int argc, char** argv) {
       std::size_t total = 0;
       double hc = 0, hd = 0;
       bool hok = false;
-      if (use_delta) {
-        DeviceCodec lc_codec;
-        lc_codec.capacity = 16 + (max_chunk_bytes / 16384 + 1) * (2 + 16384);
-        lc_codec.compress = [&](std::size_t c, const void* d_in, void* d_out) {
-          return static_cast<std::size_t>(photonzip::lc::dcu::encode_device(
-              static_cast<const unsigned char*>(d_in), chunk_list[c].second * row_elems * width, static_cast<unsigned char*>(d_out)));
-        };
-        lc_codec.decompress = [&](std::size_t c, const void* d_in, std::size_t, void* d_out) {
-          photonzip::lc::dcu::decode_device(static_cast<const unsigned char*>(d_in), static_cast<unsigned char*>(d_out),
-                                            chunk_list[c].second * row_elems * width);
-        };
+      DeviceCodec lc_codec;
+      lc_codec.capacity = 16 + (max_chunk_bytes / 16384 + 1) * (2 + 16384);
+      lc_codec.compress = [&](std::size_t c, const void* d_src, void* d_dst) {
+        return static_cast<std::size_t>(photonzip::lc::dcu::encode_device(
+            static_cast<const unsigned char*>(d_src), chunk_list[c].second * row_elems * width, static_cast<unsigned char*>(d_dst)));
+      };
+      lc_codec.decompress = [&](std::size_t c, const void* d_src, std::size_t, void* d_dst) {
+        photonzip::lc::dcu::decode_device(static_cast<const unsigned char*>(d_src), static_cast<unsigned char*>(d_dst),
+                                          chunk_list[c].second * row_elems * width);
+      };
+      if (resident) {
+        const FusedResult r = run_resident(d_in.ptr, host, chunk_list, row_elems, width, use_delta, frame_elems,
+                                           delta_encoding, delta_global, par_threads, iters, lc_codec);
+        total = r.packed, hc = r.compress_s, hd = r.decompress_s, hok = r.ok;
+      } else if (use_delta) {
         const FusedResult r = run_fused_delta(host, chunk_list, row_elems, frame_elems, delta_encoding, delta_global,
                                               par_devices, par_threads, iters, lc_codec,
                                               dump_prefix.empty() ? "" : dump_prefix + ".lc.chunks");
@@ -481,7 +575,8 @@ int main(int argc, char** argv) {
         hok = std::memcmp(restored.get(), host.data(), raw) == 0;
         if (!dump_prefix.empty()) dump_chunks(dump_prefix + ".lc.chunks", streams, sizes);
       }
-      report(use_delta ? "lc host+delta" : "lc host", raw, total, hc, hd, hok);
+      report(resident ? (use_delta ? "lc dev+delta" : "lc dev") : (use_delta ? "lc host+delta" : "lc host"), raw, total,
+             hc, hd, hok);
       status |= hok ? 0 : 1;
     }
   }
@@ -564,19 +659,23 @@ int main(int argc, char** argv) {
       }
       double hc = 0, hd = 0;
       bool hok = false;
-      if (use_delta) {
-        DeviceCodec mans_codec;
-        mans_codec.capacity = *std::max_element(caps.begin(), caps.end());
-        mans_codec.compress = [&](std::size_t c, const void* d_in, void* d_out) {
-          std::size_t out = caps[c];
-          mans::dcu::compress_internal_device(d_in, chunk_list[c].second * row_elems, params[c],
-                                              static_cast<std::uint8_t*>(d_out), out);
-          return out;
-        };
-        mans_codec.decompress = [&](std::size_t c, const void* d_in, std::size_t size, void* d_out) {
-          std::size_t out = chunk_list[c].second * row_elems * width;
-          mans::dcu::decompress_internal_device(d_in, size, params[c], static_cast<std::uint8_t*>(d_out), out);
-        };
+      DeviceCodec mans_codec;
+      mans_codec.capacity = *std::max_element(caps.begin(), caps.end());
+      mans_codec.compress = [&](std::size_t c, const void* d_src, void* d_dst) {
+        std::size_t out = caps[c];
+        mans::dcu::compress_internal_device(d_src, chunk_list[c].second * row_elems, params[c],
+                                            static_cast<std::uint8_t*>(d_dst), out);
+        return out;
+      };
+      mans_codec.decompress = [&](std::size_t c, const void* d_src, std::size_t size, void* d_dst) {
+        std::size_t out = chunk_list[c].second * row_elems * width;
+        mans::dcu::decompress_internal_device(d_src, size, params[c], static_cast<std::uint8_t*>(d_dst), out);
+      };
+      if (resident) {
+        const FusedResult r = run_resident(d_in.ptr, host, chunk_list, row_elems, width, use_delta, frame_elems,
+                                           delta_encoding, delta_global, par_threads, iters, mans_codec);
+        total = r.packed, hc = r.compress_s, hd = r.decompress_s, hok = r.ok;
+      } else if (use_delta) {
         const FusedResult r = run_fused_delta(host, chunk_list, row_elems, frame_elems, delta_encoding, delta_global,
                                               par_devices, par_threads, iters, mans_codec,
                                               dump_prefix.empty() ? "" : dump_prefix + ".mans.chunks");
@@ -601,7 +700,8 @@ int main(int argc, char** argv) {
         hok = std::memcmp(restored.get(), host.data(), raw) == 0;
         if (!dump_prefix.empty()) dump_chunks(dump_prefix + ".mans.chunks", streams, sizes);
       }
-      report(use_delta ? "mans host+delta" : "mans host", raw, total, hc, hd, hok);
+      report(resident ? (use_delta ? "mans dev+delta" : "mans dev") : (use_delta ? "mans host+delta" : "mans host"), raw,
+             total, hc, hd, hok);
       status |= hok ? 0 : 1;
     }
   }
