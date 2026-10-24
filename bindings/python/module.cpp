@@ -1,3 +1,4 @@
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -6,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,7 +16,7 @@
 #include "photonzip/core/codec_registry.hpp"
 #include "photonzip/core/codec_types.hpp"
 #include "photonzip/core/errors.hpp"
-
+#include "photonzip/preprocess/delta.hpp"
 #ifdef MANS_ENABLE_NV
 #include <cuda_runtime.h>
 #endif
@@ -106,6 +108,8 @@ std::string dtype_name(DataType dtype) {
       return "uint16";
     case DataType::kUInt32:
       return "uint32";
+    case DataType::kFloat32:
+      return "float32";
   }
   throw Error("Unsupported PhotonZip dtype.");
 }
@@ -119,6 +123,9 @@ DataType parse_dtype_name(const std::string& value) {
   }
   if (value == "uint32") {
     return DataType::kUInt32;
+  }
+  if (value == "float32") {
+    return DataType::kFloat32;
   }
   throw Error("Unsupported PhotonZip dtype: " + value);
 }
@@ -149,7 +156,10 @@ DataType parse_dtype(const DLDataType& dtype) {
   if (dtype.code == static_cast<std::uint8_t>(kDLUInt) && dtype.bits == 32) {
     return DataType::kUInt32;
   }
-  throw Error("Only uint16 and uint32 DLPack tensors are supported.");
+  if (dtype.code == static_cast<std::uint8_t>(kDLFloat) && dtype.bits == 32) {
+    return DataType::kFloat32;
+  }
+  throw Error("Only uint8, uint16, uint32 and float32 DLPack tensors are supported.");
 }
 
 MemoryKind parse_memory_kind(const DLDevice& device) {
@@ -329,6 +339,10 @@ DLDataType to_dlpack_dtype(DataType dtype) {
     case DataType::kUInt32:
       dl_dtype.bits = 32;
       return dl_dtype;
+    case DataType::kFloat32:
+      dl_dtype.code = static_cast<std::uint8_t>(kDLFloat);
+      dl_dtype.bits = 32;
+      return dl_dtype;
   }
   throw Error("Unsupported PhotonZip dtype.");
 }
@@ -373,7 +387,8 @@ std::shared_ptr<PhotonZipArrayState> make_uncompressed_state(const PhotonZipArra
   auto state = std::make_shared<PhotonZipArrayState>();
   state->buffer = std::move(buffer);
   state->logical = compressed.state().original;
-  state->original = compressed.state().original;
+  state->logical.memory_kind = state->buffer.memory_kind;
+  state->original = state->logical;
   state->codec_name = compressed.state().codec_name;
   state->backend = compressed.state().backend;
   state->codec_params = compressed.state().codec_params;
@@ -460,7 +475,13 @@ PhotonZipArray compress_tensor(const std::string& codec_name,
       make_tensor_options(codec_name, backend, dl_tensor, std::move(codec_params));
   const auto& codec = get_codec(codec_name);
   const auto input_buffer = make_input_buffer(dl_tensor);
-  const auto output = codec.compress(input_buffer, options);
+  Buffer output;
+  {
+    // The codec only touches raw buffers, so other Python threads (e.g. a thread pool
+    // compressing several chunks) can run meanwhile.
+    py::gil_scoped_release release;
+    output = codec.compress(input_buffer, options);
+  }
   return PhotonZipArray(make_compressed_state(codec_name, options, output));
 }
 
@@ -485,7 +506,11 @@ PhotonZipArray decompress_tensor(const PhotonZipArray& input,
   input_buffer.memory_kind = input.state().buffer.memory_kind;
 
   const auto& codec = get_codec(input.state().codec_name);
-  const auto output = codec.decompress(input_buffer, options);
+  Buffer output;
+  {
+    py::gil_scoped_release release;
+    output = codec.decompress(input_buffer, options);
+  }
   return PhotonZipArray(make_uncompressed_state(input, output));
 }
 
@@ -515,6 +540,144 @@ PhotonZipArray compressed_from_bytes(const std::string& codec_name,
   }
 
   return PhotonZipArray(make_compressed_state(codec_name, options, std::move(buffer)));
+}
+
+// ---- Delta preprocessing (photonzip/preprocess/delta.hpp) ----
+
+delta::Encoding parse_delta_encoding(const std::string& value) {
+  if (value == "int16") {
+    return delta::Encoding::kInt16;
+  }
+  if (value == "offset") {
+    return delta::Encoding::kOffset;
+  }
+  throw Error("Unknown delta encoding: " + value + " (expected int16 or offset).");
+}
+
+// Writable NumPy array that owns `buffer` (host memory), without a copy.
+py::array numpy_from_buffer(Buffer buffer, const std::vector<std::int64_t>& shape) {
+  auto* owner = new Buffer(std::move(buffer));
+  py::capsule base(owner, [](void* p) { delete static_cast<Buffer*>(p); });
+  const std::vector<py::ssize_t> dims(shape.begin(), shape.end());
+  return py::array_t<std::uint16_t>(dims, reinterpret_cast<std::uint16_t*>(owner->mutable_bytes()), base);
+}
+
+// The delta runs along axis 0 on the CPU: frames = shape[0], each holding the remaining
+// elements. NumPy input goes through the buffer protocol (read-only arrays are fine); anything
+// else in host memory (e.g. a PhotonZipArray or a CPU PyTorch tensor) through DLPack. The result
+// is a writable NumPy array.
+std::pair<py::object, std::uint64_t> run_delta(py::object input, const std::string& encoding_name,
+                                               const std::string& backend_name, bool decode) {
+  InputBuffer in;
+  std::vector<std::int64_t> shape;
+  std::optional<ManagedDLPackTensor> managed_tensor;  // keeps a DLPack input alive
+  if (py::isinstance<py::array>(input)) {
+    const auto array = py::reinterpret_borrow<py::array>(input);
+    if (!py::isinstance<py::array_t<std::uint16_t>>(input)) {
+      throw Error("Delta preprocessing supports uint16 arrays only.");
+    }
+    if (!(array.flags() & py::array::c_style) || array.ndim() < 1 || array.size() == 0) {
+      throw Error("Delta preprocessing needs a non-empty C-contiguous array.");
+    }
+    in.data = array.data();
+    in.size = static_cast<std::size_t>(array.nbytes());
+    in.memory_kind = MemoryKind::kHost;
+    shape.assign(array.shape(), array.shape() + array.ndim());
+  } else {
+    managed_tensor.emplace(input);
+    const auto& tensor = managed_tensor->tensor();
+    if (parse_dtype(tensor.dtype) != DataType::kUInt16) {
+      throw Error("Delta preprocessing supports uint16 tensors only.");
+    }
+    in = make_input_buffer(tensor);
+    shape.assign(tensor.shape, tensor.shape + tensor.ndim);
+  }
+  const auto encoding = parse_delta_encoding(encoding_name);
+  if (in.memory_kind != MemoryKind::kHost) {
+    throw Error("Delta preprocessing works on host memory only.");
+  }
+  if (parse_backend(backend_name, Backend::kCpu) != Backend::kCpu) {
+    throw Error("Delta preprocessing runs on the cpu backend only.");
+  }
+
+  const std::size_t frames = static_cast<std::size_t>(shape[0]);
+  const std::size_t frame_elems = in.size / sizeof(std::uint16_t) / frames;
+  const auto* src = static_cast<const std::uint16_t*>(in.data);
+
+  Buffer output = make_host_buffer(in.size);
+  std::uint64_t clipped = 0;
+  {
+    py::gil_scoped_release release;
+    auto* dst = reinterpret_cast<std::uint16_t*>(output.mutable_bytes());
+    if (decode) {
+      delta::decode_host(src, dst, frames, frame_elems, encoding);
+    } else {
+      clipped = delta::encode_host(src, dst, frames, frame_elems, encoding);
+    }
+  }
+  return {numpy_from_buffer(std::move(output), shape), clipped};
+}
+
+// Host copy of `array` (compressed or not) in CUDA memory; the metadata is unchanged.
+PhotonZipArray copy_to_host(const PhotonZipArray& array) {
+  const auto& state = array.state();
+  if (state.buffer.memory_kind == MemoryKind::kHost) {
+    return array;
+  }
+  auto copy = std::make_shared<PhotonZipArrayState>(state);
+  const std::size_t size = state.buffer.size;
+#ifdef MANS_ENABLE_NV
+  {
+    py::gil_scoped_release release;
+    copy->buffer = make_host_buffer(size);
+    const cudaError_t status = cudaMemcpy(
+        copy->buffer.mutable_bytes(), state.buffer.bytes(), size, cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+      throw Error(std::string("cudaMemcpy D2H failed: ") + cudaGetErrorString(status));
+    }
+  }
+#else
+  throw Error("This PhotonZip build has no CUDA backend.");
+#endif
+  copy->buffer.size = size;
+  copy->logical.memory_kind = MemoryKind::kHost;
+  copy->original.memory_kind = MemoryKind::kHost;
+  return PhotonZipArray(copy);
+}
+
+// The same uncompressed data viewed with another shape (no copy).
+PhotonZipArray reshape_array(const PhotonZipArray& array, const std::vector<std::int64_t>& shape) {
+  const auto& state = array.state();
+  if (state.compressed) {
+    throw Error("reshape applies to uncompressed arrays only.");
+  }
+  std::size_t elements = 1;
+  for (const auto dim : shape) {
+    if (dim <= 0) {
+      throw Error("reshape needs positive dimensions.");
+    }
+    elements = checked_product(elements, static_cast<std::size_t>(dim), "reshape element count");
+  }
+  std::size_t current = 1;
+  for (const auto dim : state.logical.shape) {
+    current *= static_cast<std::size_t>(dim);
+  }
+  if (elements != current) {
+    throw Error("reshape must keep the number of elements.");
+  }
+  auto view = std::make_shared<PhotonZipArrayState>(state);
+  view->logical.shape = shape;
+  view->original.shape = shape;
+  return PhotonZipArray(view);
+}
+
+// Backends compiled into this build: ["cpu"] or ["cpu", "cuda"].
+std::vector<std::string> available_backends() {
+  std::vector<std::string> backends{"cpu"};
+#ifdef MANS_ENABLE_NV
+  backends.emplace_back("cuda");
+#endif
+  return backends;
 }
 
 py::object invoke_codec(const std::string& codec_name,
@@ -566,6 +729,11 @@ PYBIND11_MODULE(_native, module) {
       .def("to_bytes", [](const photonzip::PhotonZipArray& array) {
         return photonzip::buffer_to_py_bytes(array.state().buffer);
       })
+      .def_property_readonly("device", [](const photonzip::PhotonZipArray& array) {
+        return array.state().buffer.memory_kind == photonzip::MemoryKind::kCuda ? "cuda" : "cpu";
+      })
+      .def("to_host", &photonzip::copy_to_host)
+      .def("reshape", &photonzip::reshape_array, py::arg("shape"))
       .def("__dlpack__",
            [](const photonzip::PhotonZipArray& array, py::args args, py::kwargs kwargs) {
              (void)args;
@@ -578,6 +746,7 @@ PYBIND11_MODULE(_native, module) {
       });
 
   module.def("list_codecs", &photonzip::list_codecs);
+  module.def("available_backends", &photonzip::available_backends);
   module.def(
       "compress_tensor",
       &photonzip::compress_tensor,
@@ -599,6 +768,25 @@ PYBIND11_MODULE(_native, module) {
       py::arg("shape"),
       py::arg("backend"),
       py::arg("codec_params") = std::vector<std::uint32_t>{});
+  module.def(
+      "delta_encode",
+      [](py::object input, const std::string& encoding, const std::string& backend) {
+        auto [array, clipped] = photonzip::run_delta(std::move(input), encoding, backend, false);
+        return py::make_tuple(array, static_cast<unsigned long long>(clipped));
+      },
+      py::arg("input"),
+      py::arg("encoding"),
+      py::arg("backend") = "auto",
+      "Inter-frame delta along axis 0 of a uint16 tensor; returns (array, clipped_elements).");
+  module.def(
+      "delta_decode",
+      [](py::object input, const std::string& encoding, const std::string& backend) {
+        return photonzip::run_delta(std::move(input), encoding, backend, true).first;
+      },
+      py::arg("input"),
+      py::arg("encoding"),
+      py::arg("backend") = "auto",
+      "Inverse of delta_encode.");
   module.def(
       "invoke_codec",
       &photonzip::invoke_codec,

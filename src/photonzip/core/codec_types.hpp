@@ -30,6 +30,7 @@ enum class DataType {
   kUInt8,
   kUInt16,
   kUInt32,
+  kFloat32,
 };
 
 struct CodecOptions {

@@ -5,7 +5,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "photonzip"
 version = "0.1.0"
-description = "Python bindings for PhotonZip codecs"
+description = "PhotonZip: tensor-first MANS and LC lossless and PFPL lossy compression on CPU and CUDA"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
@@ -16,14 +16,17 @@ keywords = [
   "compression",
   "tensor",
   "dlpack",
+  "lossless",
+  "lossy",
+  "hdf5",
   "cuda",
   "mans",
 ]
+dependencies = ["numpy"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: BSD License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.9",

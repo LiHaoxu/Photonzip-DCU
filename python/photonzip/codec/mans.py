@@ -22,6 +22,11 @@ except ModuleNotFoundError:
 
 _DEFAULT_THREADS_WARNING_EMITTED = False
 H5Z_FILTER_MANS_ID = 32032
+MANS_MODE_P = 0
+MANS_MODE_R = 1
+
+# DLPack device type (DLDeviceType) of tensors in CUDA memory.
+_KDL_CUDA = 2
 
 
 def _warn_default_threads_once() -> None:
@@ -53,6 +58,25 @@ def _element_count(shape: Iterable[int]) -> int:
     return total
 
 
+def _mode_id(mode: str) -> int:
+    if mode == "p":
+        return MANS_MODE_P
+    if mode == "r":
+        return MANS_MODE_R
+    raise ValueError(f"Unsupported MANS mode: {mode}")
+
+
+def _resolve_backend(tensor, backend: str) -> str:
+    """The backend a compress call will use: ``backend``, or for "auto" the tensor's device."""
+    normalized = str(backend).lower()
+    if normalized != "auto":
+        return normalized
+    device = getattr(tensor, "__dlpack_device__", None)
+    if device is None:
+        return "cpu"
+    return "cuda" if int(device()[0]) == _KDL_CUDA else "cpu"
+
+
 def _thread_csv_path_from_env() -> str | Path | None:
     csv_path = os.environ.get("MANS_THREAD_CSV")
     if csv_path:
@@ -70,16 +94,17 @@ def _normalize_chunk_shape(chunks: Iterable[int]) -> tuple[int, ...]:
 
 
 def _mans_dims_from_shape(shape: Iterable[int]) -> tuple[int, int, int, int]:
+    """Convert a C-order shape to MANS's fastest-dimension-first x/y/z layout."""
     normalized = tuple(int(dim) for dim in shape)
     if len(normalized) == 1:
         return 1, normalized[0], 0, 0
     if len(normalized) == 2:
-        return 2, normalized[0], normalized[1], 0
+        return 2, normalized[1], normalized[0], 0
 
-    merged_tail = 1
-    for dim in normalized[2:]:
-        merged_tail *= dim
-    return 3, normalized[0], normalized[1], merged_tail
+    merged_leading = 1
+    for dim in normalized[:-2]:
+        merged_leading *= dim
+    return 3, normalized[-1], normalized[-2], merged_leading
 
 
 def _mans_dtype_from_input(value) -> int:
@@ -217,6 +242,14 @@ class AutotuneResult:
 
 @dataclass(frozen=True)
 class MansOptions(CodecOptions):
+    """Options for the MANS codec (lossless, uint16/uint32, 1 to 3 dimensions).
+
+    ``mode`` is ``"p"`` (ADM + PANS, faster) or ``"r"`` (ADM + FSE, higher ratio). The CPU
+    backend uses ``adm_compress_thread``/``adm_decompress_thread``, taken from an autotune
+    thread table (``thread_table``, ``thread_csv_path`` or ``$MANS_THREAD_CSV``) when not given.
+    The ADM geometry comes from the tensor shape (last axis fastest).
+    """
+
     mode: str = "p"
     adm_compress_thread: int | None = None
     adm_decompress_thread: int | None = None
@@ -258,14 +291,9 @@ class MansOptions(CodecOptions):
         return compress_thread, decompress_thread
 
     def to_codec_params(self, *, tensor=None, backend: str = "auto") -> list[int]:
-        if self.mode == "p":
-            mans_mode = 0
-        elif self.mode == "r":
-            mans_mode = 1
-        else:
-            raise ValueError(f"Unsupported MANS mode: {self.mode}")
-
-        compress_thread, decompress_thread = self._resolve_threads(tensor=tensor, backend=backend)
+        mans_mode = _mode_id(self.mode)
+        resolved_backend = _resolve_backend(tensor, backend)
+        compress_thread, decompress_thread = self._resolve_threads(tensor=tensor, backend=resolved_backend)
         return [mans_mode, compress_thread, decompress_thread]
 
 
@@ -292,12 +320,7 @@ def to_hdf5_compression_opts(
     else:
         effective_shape = chunk_shape
 
-    if mans_options.mode == "p":
-        mans_mode = 0
-    elif mans_options.mode == "r":
-        mans_mode = 1
-    else:
-        raise ValueError(f"Unsupported MANS mode: {mans_options.mode}")
+    mans_mode = _mode_id(mans_options.mode)
 
     compress_thread, decompress_thread = mans_options._resolve_threads_for_shape(effective_shape)
     dims, nx, ny, nz = _mans_dims_from_shape(chunk_shape)

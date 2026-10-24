@@ -8,22 +8,31 @@ import numpy as np
 import pytest
 
 
-sys.path.insert(0, "/root/workspace/PhotonZip/build/bindings/python")
-sys.path.insert(0, "/root/workspace/PhotonZip/python")
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+NATIVE_DIR = REPO_ROOT / "build" / "bindings" / "python"
+PACKAGE_DIR = REPO_ROOT / "python"
+
+sys.path.insert(0, str(NATIVE_DIR))
+sys.path.insert(0, str(PACKAGE_DIR))
 
 import photonzip
+import photonzip.codec.lc as lc
 import photonzip.codec.mans as mans
+import photonzip.codec.pfpl as pfpl
 
 
-DATASET = pathlib.Path(
-    "/root/workspace/PhotonZip/3rdparty/lossless/MANS/testdata/u2/exafel/exafel_59200x388_64kB.u2"
-)
+DATASET = REPO_ROOT / "3rdparty/lossless/MANS/testdata/u2/exafel/exafel_59200x388_64kB.u2"
 
 CPU_DEVICE = int(np.arange(1, dtype=np.uint8).__dlpack_device__()[0])
 
 
 def _u16():
     return np.fromfile(DATASET, dtype=np.uint16)
+
+
+def _f32():
+    """The uint16 sample scaled into a positive float range PFPL's log quantiser can bin."""
+    return (_u16().astype(np.float32) + 1.0) * 0.5
 
 
 def _roundtrip(x, **kwargs):
@@ -55,9 +64,10 @@ def _skip_if_cuda_backend_missing(exc: RuntimeError):
 def _run_python(code: str) -> str:
     wrapped = textwrap.dedent(f"""
         import sys
-        sys.path.insert(0, "/root/workspace/PhotonZip/build/bindings/python")
-        sys.path.insert(0, "/root/workspace/PhotonZip/python")
+        sys.path.insert(0, {str(NATIVE_DIR)!r})
+        sys.path.insert(0, {str(PACKAGE_DIR)!r})
         import photonzip.codec.mans as mans
+        DATASET = {str(DATASET)!r}
         {code}
     """)
     result = subprocess.run([sys.executable, "-c", wrapped], capture_output=True, text=True)
@@ -84,6 +94,74 @@ def test_numpy_cpu_3d():
     x = _u16().reshape(16, 16, 128)
     y = _roundtrip(x, codec_options=_mans())
     assert y.shape == x.shape and y.tobytes() == x.tobytes()
+
+
+def test_lc_registered():
+    assert "lc" in photonzip.list_codecs()
+
+
+def test_lc_numpy_cpu_1d():
+    x = _u16()
+    y = _roundtrip(x, codec="lc", codec_options=lc.LcOptions())
+    assert y.tobytes() == x.tobytes()
+
+
+def test_lc_numpy_cpu_2d():
+    x = _u16().reshape(128, 256)
+    y = _roundtrip(x, codec="lc", codec_options=lc.LcOptions())
+    assert y.shape == x.shape and y.tobytes() == x.tobytes()
+
+
+def test_lc_numpy_cpu_3d():
+    x = _u16().reshape(16, 16, 128)
+    y = _roundtrip(x, codec="lc", codec_options=lc.LcOptions())
+    assert y.shape == x.shape and y.tobytes() == x.tobytes()
+
+
+def test_pfpl_registered():
+    assert "pfpl" in photonzip.list_codecs()
+
+
+@pytest.mark.parametrize("shape", [(-1,), (128, 256), (16, 16, 128)])
+def test_pfpl_numpy_cpu_honours_error_bound(shape):
+    error_bound = 1e-3
+    x = _f32().reshape(shape)
+    y = _roundtrip(x, codec="pfpl", codec_options=pfpl.PfplOptions(error_bound=error_bound))
+    assert y.shape == x.shape
+    # PFPL accepts a bin when the reconstruction is within orig * (1 + eb) evaluated in
+    # float32, so the enforced bound can exceed the requested one by about one epsilon.
+    realised = error_bound + 2.0 * float(np.finfo(np.float32).eps)
+    assert np.all(np.abs(y - x) <= realised * np.abs(x))
+
+
+def test_pfpl_tighter_bound_compresses_less():
+    x = _f32()
+    loose = photonzip.compress(x, codec="pfpl", codec_options=pfpl.PfplOptions(error_bound=1e-2))
+    tight = photonzip.compress(x, codec="pfpl", codec_options=pfpl.PfplOptions(error_bound=1e-5))
+    assert len(loose.to_bytes()) < len(tight.to_bytes())
+
+
+def test_pfpl_threshold_keeps_large_samples_exact():
+    x = _f32()
+    threshold = float(np.median(x))
+    y = _roundtrip(
+        x,
+        codec="pfpl",
+        codec_options=pfpl.PfplOptions(error_bound=1e-2, threshold=threshold),
+    )
+    large = x >= threshold
+    assert large.any()
+    assert np.array_equal(y[large], x[large])
+
+
+def test_pfpl_rejects_uint16():
+    with pytest.raises(Exception, match="float32"):
+        photonzip.compress(_u16(), codec="pfpl", codec_options=pfpl.PfplOptions())
+
+
+def test_pfpl_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="Unsupported PFPL mode"):
+        pfpl.PfplOptions(mode="abs").to_codec_params()
 
 
 def test_mans_autotune_smoke():
@@ -122,7 +200,7 @@ def test_compress_cpu_backend_keeps_payload_on_host():
 def test_compress_cuda_backend_moves_host_payload_to_device():
     out = _run_python("""
         import numpy as np, photonzip
-        x = np.fromfile(r'/root/workspace/PhotonZip/3rdparty/lossless/MANS/testdata/u2/exafel/exafel_59200x388_64kB.u2', dtype=np.uint16)
+        x = np.fromfile(DATASET, dtype=np.uint16)
         try: packed = photonzip.compress(x, backend='cuda', codec_options=mans.MansOptions(warn_on_default_threads=False))
         except RuntimeError as e: print(f'SKIP:{e}'); raise SystemExit(0)
         print(int(packed.__dlpack_device__()[0]) != int(np.arange(1, dtype=np.uint8).__dlpack_device__()[0]))
@@ -133,7 +211,7 @@ def test_compress_cuda_backend_moves_host_payload_to_device():
 def test_host_input_can_roundtrip_back_to_cpu_via_cuda_backend():
     out = _run_python("""
         import numpy as np, torch, photonzip
-        x = np.fromfile(r'/root/workspace/PhotonZip/3rdparty/lossless/MANS/testdata/u2/exafel/exafel_59200x388_64kB.u2', dtype=np.uint16)
+        x = np.fromfile(DATASET, dtype=np.uint16)
         try: y = torch.from_dlpack(photonzip.decompress(photonzip.compress(x, backend='cuda', codec_options=mans.MansOptions(warn_on_default_threads=False)))).cpu().numpy()
         except RuntimeError as e: print(f'SKIP:{e}'); raise SystemExit(0)
         print(y.tobytes() == x.tobytes())
@@ -144,7 +222,7 @@ def test_host_input_can_roundtrip_back_to_cpu_via_cuda_backend():
 def test_decompress_cuda_backend_returns_device_from_host_input():
     out = _run_python("""
         import numpy as np, torch, photonzip
-        x = np.fromfile(r'/root/workspace/PhotonZip/3rdparty/lossless/MANS/testdata/u2/exafel/exafel_59200x388_64kB.u2', dtype=np.uint16)
+        x = np.fromfile(DATASET, dtype=np.uint16)
         try: y = torch.from_dlpack(photonzip.decompress(photonzip.compress(x, backend='cuda', codec_options=mans.MansOptions(warn_on_default_threads=False))))
         except RuntimeError as e: print(f'SKIP:{e}'); raise SystemExit(0)
         print(y.device.type == 'cuda' and y.cpu().numpy().tobytes() == x.tobytes())
@@ -156,7 +234,7 @@ def test_cuda_device_input_compresses_to_device_payload():
     out = _run_python("""
         import numpy as np, torch, photonzip
         if not torch.cuda.is_available(): print('SKIP:CUDA not available'); raise SystemExit(0)
-        x = torch.from_numpy(np.fromfile(r'/root/workspace/PhotonZip/3rdparty/lossless/MANS/testdata/u2/exafel/exafel_59200x388_64kB.u2', dtype=np.uint16)).cuda()
+        x = torch.from_numpy(np.fromfile(DATASET, dtype=np.uint16)).cuda()
         try: packed = photonzip.compress(x, backend='cuda', codec_options=mans.MansOptions(warn_on_default_threads=False))
         except RuntimeError as e: print(f'SKIP:{e}'); raise SystemExit(0)
         print(packed.compressed and packed.__dlpack_device__()[0] != np.arange(1, dtype=np.uint8).__dlpack_device__()[0])
@@ -168,7 +246,7 @@ def test_cuda_device_input_and_output_stay_on_device():
     out = _run_python("""
         import numpy as np, torch, photonzip
         if not torch.cuda.is_available(): print('SKIP:CUDA not available'); raise SystemExit(0)
-        x = torch.from_numpy(np.fromfile(r'/root/workspace/PhotonZip/3rdparty/lossless/MANS/testdata/u2/exafel/exafel_59200x388_64kB.u2', dtype=np.uint16)).cuda()
+        x = torch.from_numpy(np.fromfile(DATASET, dtype=np.uint16)).cuda()
         try: y = torch.from_dlpack(photonzip.decompress(photonzip.compress(x, backend='cuda', codec_options=mans.MansOptions(warn_on_default_threads=False))))
         except RuntimeError as e: print(f'SKIP:{e}'); raise SystemExit(0)
         print(y.device.type == 'cuda' and torch.equal(y, x))
