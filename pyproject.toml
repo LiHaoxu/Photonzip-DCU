@@ -5,7 +5,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "photonzip"
 version = "0.1.0"
-description = "PhotonZip: lossless LC (CPU/DCU) and MANS (DCU) compression for detector data"
+description = "PhotonZip: tensor-first lossless MANS and LC compression on CPU, CUDA and Hygon DCU"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
@@ -18,6 +18,9 @@ keywords = [
   "dlpack",
   "lossless",
   "hdf5",
+  "cuda",
+  "dcu",
+  "mans",
 ]
 dependencies = ["numpy"]
 classifiers = [

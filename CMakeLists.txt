@@ -13,6 +13,8 @@ option(PHOTONZIP_ENABLE_DCU "Build the DCU (Hygon DTK / HIP) backend: LC on DCU 
 set(PHOTONZIP_DCU_HIP_COMPILER "" CACHE FILEPATH "DTK hipcc (or its dcc driver); found on PATH if empty")
 set(PHOTONZIP_DCU_ARCH "" CACHE STRING "DCU offload architecture from rocminfo, e.g. gfx936 (BW); DTK 26.04 targets gfx906/926/928/936")
 set(PHOTONZIP_DCU_HIP_FLAGS "" CACHE STRING "Extra flags for the DTK HIP compiler")
+set(PHOTONZIP_MANS_TARGET_PLATFORM "" CACHE STRING
+    "TARGET_PLATFORM for the vendored MANS build (cpu or cpu_nv); empty: cpu_nv when a CUDA compiler is found, else cpu")
 
 # =========================================================
 # DCU backend
@@ -100,10 +102,48 @@ if(PHOTONZIP_ENABLE_DCU)
 endif()
 
 # =========================================================
+# Vendored MANS (CPU, and NVIDIA GPUs through CUDA)
+# =========================================================
+# The MANS DCU sources are compiled into photonzip_dcu above, so the MANS build itself never
+# includes its DCU backend. Its H5Z-MANS plugin is the CPU/CUDA one; DCU builds ship the DCU
+# H5Z-MANS from filters/ under the same name and filter ID instead.
+if(NOT TARGET mans_common)
+  set(_photonzip_mans_platform "${PHOTONZIP_MANS_TARGET_PLATFORM}")
+  if(NOT _photonzip_mans_platform)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+      set(_photonzip_mans_platform "cpu_nv")
+    else()
+      set(_photonzip_mans_platform "cpu")
+    endif()
+  endif()
+  if(NOT _photonzip_mans_platform MATCHES "^cpu(_nv)?$")
+    message(FATAL_ERROR "PHOTONZIP_MANS_TARGET_PLATFORM must be cpu or cpu_nv "
+                        "(the DCU backend is enabled with PHOTONZIP_ENABLE_DCU).")
+  endif()
+  message(STATUS "PhotonZip: MANS TARGET_PLATFORM=${_photonzip_mans_platform}")
+
+  if(PHOTONZIP_BUILD_HDF5_FILTERS AND NOT PHOTONZIP_ENABLE_DCU)
+    set(_photonzip_mans_h5z ON)
+  else()
+    set(_photonzip_mans_h5z OFF)
+  endif()
+  if(PHOTONZIP_ENABLE_DCU AND NOT DEFINED HDF5_PREFER_PARALLEL)
+    # The DCU filters are tested against a serial HDF5 (see README).
+    set(HDF5_PREFER_PARALLEL OFF CACHE BOOL "Prefer parallel HDF5 if available")
+  endif()
+  set(BUILD_HDF5_PLUGIN ${_photonzip_mans_h5z} CACHE BOOL "Build the vendored H5Z-MANS plugin" FORCE)
+  set(TARGET_PLATFORM "${_photonzip_mans_platform}" CACHE STRING "Target platform of the vendored MANS build" FORCE)
+  add_subdirectory(3rdparty/lossless/MANS)
+endif()
+
+# =========================================================
 # Core library
 # =========================================================
 add_library(photonzip_core STATIC
   src/photonzip/core/codec_registry.cpp
+  src/photonzip/codecs/mans/mans_codec.cpp
   src/photonzip/codecs/lc/lc_codec.cpp
   src/photonzip/preprocess/delta_cpu.cpp
 )
@@ -111,17 +151,26 @@ add_library(photonzip_core STATIC
 target_include_directories(photonzip_core
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/lossless/MANS
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty
 )
+
+target_link_libraries(photonzip_core PUBLIC mans_common)
 
 find_package(OpenMP QUIET)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(photonzip_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
+if(TARGET mans_nv_core)
+  find_package(CUDAToolkit REQUIRED)
+  target_compile_definitions(photonzip_core PUBLIC MANS_ENABLE_NV)
+  target_include_directories(photonzip_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(photonzip_core PUBLIC CUDA::cudart)
+endif()
+
 if(PHOTONZIP_ENABLE_DCU)
-  target_sources(photonzip_core PRIVATE src/photonzip/codecs/mans/mans_codec.cpp)
   target_link_libraries(photonzip_core PUBLIC photonzip_dcu)
 endif()
 

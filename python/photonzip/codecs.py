@@ -28,8 +28,15 @@ class Codec(ABC):
         raise NotImplementedError(f"Codec {self.name!r} does not implement operation {operation!r}.")
 
 
+from importlib import import_module
+
 from .codec import discover_codecs
 from .codec_registry import get_codec_handler, list_registered_codecs
+
+try:
+    _native = import_module("photonzip._native")
+except ModuleNotFoundError:
+    _native = import_module("_native")
 
 
 discover_codecs()
@@ -37,6 +44,11 @@ discover_codecs()
 
 def list_codecs():
     return list_registered_codecs()
+
+
+def available_backends():
+    """Backends compiled into this build: always "cpu", plus "cuda" and/or "dcu"."""
+    return list(_native.available_backends())
 
 
 def invoke_codec(codec, operation, request=None):
@@ -48,7 +60,7 @@ def invoke_codec(codec, operation, request=None):
 
 def compress(
     tensor,
-    codec="lc",
+    codec="mans",
     backend="auto",
     codec_params=None,
     codec_options=None,

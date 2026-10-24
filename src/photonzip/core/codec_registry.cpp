@@ -5,9 +5,7 @@
 #include <utility>
 
 #include "photonzip/codecs/lc/lc_codec.hpp"
-#ifdef PHOTONZIP_ENABLE_DCU
 #include "photonzip/codecs/mans/mans_codec.hpp"
-#endif
 #include "photonzip/core/errors.hpp"
 
 namespace photonzip {
@@ -62,10 +60,8 @@ std::vector<std::string> list_codecs() {
 
 void register_builtin_codecs() {
   std::call_once(builtin_registration_flag(), []() {
-    register_codec(make_lc_codec());
-#ifdef PHOTONZIP_ENABLE_DCU
     register_codec(make_mans_codec());
-#endif
+    register_codec(make_lc_codec());
   });
 }
 

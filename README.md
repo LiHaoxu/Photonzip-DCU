@@ -1,72 +1,105 @@
-# PhotonZip
+# 📦 PhotonZip
 
-PhotonZip is a tensor-first Python wrapper around lossless codecs for detector
-and tomography data. It ships two codecs:
+PhotonZip is a tensor-first Python wrapper around vendored lossless codecs for
+detector and tomography data, on the CPU, NVIDIA GPUs (CUDA) and Hygon DCUs.
 
-**PhotonZip-LC** (`codec="lc"`)
+This repository is [hpdps-group/PhotonZip](https://github.com/hpdps-group/PhotonZip)
+plus a DCU backend, the LC codec and global delta preprocessing. Upstream is merged
+as a git remote (`git merge upstream/main`).
 
-- Fixed [LC framework](https://github.com/burtscher/LC-framework) pipeline
-  `DIFFMS_2 BIT_2 RZE_2`, applied independently to 16 KiB chunks.
-- Lossless; no tunable parameters. Runs on the CPU (OpenMP) and, in DCU builds,
-  on Hygon DCUs (HIP kernels from LC's HIP code generator).
+| Codec | Data | CPU | CUDA | DCU | HDF5 filter |
+|---|---|---|---|---|---|
+| **MANS** (`codec="mans"`) | uint16/uint32, 1-3D | P- and R-mode, autotuned threads | P- and R-mode | P-mode | `H5Z-MANS` (32032) |
+| **LC** (`codec="lc"`) | uint16 | yes | - | yes | `H5Z-LC` (32771) |
+
+**MANS** ([hpdps-group/MANS](https://github.com/hpdps-group/MANS), ADM mapping + ANS)
+
+- CPU and CUDA paths from upstream PhotonZip, exposed through `photonzip.compress(...)`,
+  `photonzip.decompress(...)` and `photonzip.codec.mans.autotune(...)`.
+- DCU path in DCU builds (P-mode). The streams of all backends carry their geometry;
+  P-mode streams decode on any backend.
+
+**LC** ([LC framework](https://github.com/burtscher/LC-framework) pipeline `DIFFMS_2 BIT_2 RZE_2`)
+
+- Applied independently to 16 KiB chunks. Lossless, no tunable parameters.
+- CPU (OpenMP) and, in DCU builds, DCU (HIP kernels from LC's HIP code generator).
 - One bitstream for both backends, compatible with the LC framework's standalone
   compressors: compress on the DCU, decompress on the CPU, or the other way round.
-- HDF5 filter plugin `H5Z-LC` (filter ID `32771`).
-
-**PhotonZip-MANS** (`codec="mans"`, DCU builds only)
-
-- [MANS](https://github.com/hpdps-group/MANS) (ADM mapping + ANS) in P-mode on the
-  DCU, for uint16/uint32 tensors with 1-3 dimensions.
-- Emits complete MANS streams that the upstream MANS CPU backend can decode.
-- HDF5 filter plugin `H5Z-MANS` (filter ID `32032`, same as upstream H5Z-MANS).
 
 Both codecs can be combined with the optional global inter-slice delta
 preprocessing (`photonzip.preprocess`), which runs on the CPU or, in DCU builds,
 on the DCU, where its output can stay in device memory for the codec.
 
-> **Status:** tested on a Hygon BW DCU (gfx936, 80 CUs) with DTK 26.04, and with
-> DTK 25.04.1 + PyTorch 2.5.1 for device tensors:
->
-> - LC payloads from the DCU are byte-identical to the LC framework's official
->   standalone CPU and GPU compressors, and both official decoders read them.
-> - MANS streams from the DCU decode with the upstream MANS CPU backend and vice
->   versa (P-mode); the upstream MANS DCU/CPU test suite passes.
-> - HDF5 files written with the DCU filters read back with the CPU paths
->   (`PHOTONZIP_LC_BACKEND=cpu`, upstream H5Z-MANS) and vice versa.
-
 The Python layer is DLPack-based; `compress(...)` and `decompress(...)` return
 a `PhotonZipArray`, which converts to NumPy with `np.from_dlpack(...)`.
+
+> **Status**
+>
+> - CPU + CUDA: built and tested on an RTX 5090 (CUDA 12.8 and, with PyTorch 2.8,
+>   12.9): `tests/python/test_codecs.py` passes, and MANS P-mode streams decode across
+>   the CPU and CUDA backends.
+> - DCU: tested on a Hygon BW DCU (gfx936, 80 CUs) with DTK 26.04, and with DTK 25.04.1 +
+>   PyTorch 2.5.1 for device tensors. LC payloads from the DCU are byte-identical to the LC
+>   framework's official standalone CPU and GPU compressors, and both official decoders
+>   read them. MANS streams from the DCU decode with the MANS CPU backend and vice versa
+>   (P-mode); the upstream MANS DCU/CPU test suite passes. HDF5 files written with the DCU
+>   filters read back with the CPU paths (`PHOTONZIP_LC_BACKEND=cpu`, the CPU H5Z-MANS)
+>   and vice versa.
 
 ## Layout
 
 ```
 3rdparty/lossless/lc/      LC framework components (host h_* and device d_*, header-only)
-3rdparty/lossless/MANS/    MANS DCU backend (vendored subset, see VENDORED.md)
+3rdparty/lossless/MANS/    MANS (CPU, CUDA, DCU backends, H5Z-MANS), vendored, see VENDORED.md
 src/photonzip/core/        codec registry, buffer types, DLPack header, HIP helpers
 src/photonzip/codecs/lc/   LC pipeline (CPU), LC DCU kernels, codec registration
-src/photonzip/codecs/mans/ MANS codec (DCU)
+src/photonzip/codecs/mans/ MANS codec (CPU, CUDA, DCU)
 src/photonzip/preprocess/  inter-slice delta: CPU (OpenMP) and DCU (HIP) kernels
 bindings/python/           pybind11 extension module photonzip._native
-python/photonzip/          Python package (API, LC codec, preprocessing)
-filters/                   HDF5 filter plugins H5Z-LC and H5Z-MANS
+python/photonzip/          Python package (API, codecs, preprocessing)
+filters/                   HDF5 filter plugins H5Z-LC and (DCU builds) H5Z-MANS
 examples/photonzip_cli.py  command-line tool with the .pzc container format
+examples/MANS/             MANS examples (autotune, CPU/CUDA round trips, HDF5)
+tests/python/              pytest suite (CPU, CUDA)
 tests/test_dcu.py          DCU correctness checks (Python API, device tensors, HDF5)
 benchmarks/dcu_bench.cpp   DCU throughput benchmark (device-resident, host chunks, multi-DCU)
+testdata/u2/               sample uint16 volumes (127^3)
 ```
 
-## Install
+## 🔧 Install
 
-Requirements: a C++17 compiler with OpenMP, CMake >= 3.20, Python >= 3.9,
-NumPy, and (for the HDF5 filter) the HDF5 C library and headers.
+Requirements: a C++17 compiler with OpenMP, CMake >= 3.20, Python >= 3.9, NumPy,
+and (for the HDF5 filters) the HDF5 C library with its high-level library, plus MPI
+for the MANS HDF5 tools. MANS is vendored, so no submodules are needed.
 
 ```bash
-python3 -m pip install .
+git clone https://github.com/LiHaoxu/Photonzip-DCU.git
+cd Photonzip-DCU
+python3 -m pip install .            # or: python3 -m pip install -e . --no-deps
 ```
 
-Without HDF5 installed, skip the filter plugin:
+Without HDF5 installed, skip the filter plugins:
 
 ```bash
 python3 -m pip install . -Ccmake.define.PHOTONZIP_BUILD_HDF5_FILTERS=OFF
+```
+
+The CUDA path of MANS is built when CMake finds a CUDA compiler. Force a platform
+with `-DPHOTONZIP_MANS_TARGET_PLATFORM=cpu` or `cpu_nv`; `photonzip.available_backends()`
+lists what a build has. For the CUDA examples and tests, use an environment with
+PyTorch, e.g.
+
+```bash
+conda create -n photonzip python=3.12 pytorch::pytorch pytorch::pytorch-cuda=12.1 -c pytorch -c conda-forge
+conda activate photonzip
+```
+
+To build the native module and plugins with CMake only:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -Dpybind11_DIR=$(python3 -m pybind11 --cmakedir)
+cmake --build build -j
+python3 -m pytest -q tests/python/test_codecs.py     # uses build/bindings/python
 ```
 
 ### DCU build
@@ -97,6 +130,10 @@ build/bin/photonzip_dcu_bench scan.u2 --dims 100 2048 2048 --delta offset --fram
 build/bin/photonzip_dcu_bench scan.u2 --dims 100 2048 2048 --chunk-rows 10 --resident --host-only --parallel 1 4
 ```
 
+A DCU build also contains the MANS CPU backend, so DCU streams can be checked
+against the CPU in one process (`tests/test_dcu.py` does). Its `H5Z-MANS` is the DCU
+plugin from `filters/` (the vendored CPU/CUDA plugin is not built).
+
 For the HDF5 filters, use a serial, shared HDF5 and make sure h5py links the
 same `libhdf5` as the plugins (e.g. `HDF5_DIR=... pip install --no-binary=h5py h5py`);
 two HDF5 copies in one process break filter callbacks.
@@ -105,7 +142,243 @@ If the DTK compiler cannot find the host C++ headers (`fatal error: 'cmath' file
 not found`), pass them via `PHOTONZIP_DCU_HIP_FLAGS`, e.g.
 `-DPHOTONZIP_DCU_HIP_FLAGS="-isystem /usr/include/c++/11 -isystem /usr/include/x86_64-linux-gnu/c++/11"`.
 
-### DCU performance
+## 🧪 Usage
+
+### CLI
+
+```bash
+# CPU, high throughput (LC)
+python examples/photonzip_cli.py --mode compress \
+  --input testdata/u2/sfc-gi/sfc-gi_127x127x127_4096kB.u2 --output /tmp/photonzip_cpu.pzc \
+  --dims 127 127 127 --dtype uint16 --backend cpu --quality-level lossless --throughput-level high
+
+# CPU, high compression ratio (MANS R-mode)
+python examples/photonzip_cli.py --mode compress \
+  --input testdata/u2/sfc-gi/sfc-gi_127x127x127_4096kB.u2 --output /tmp/photonzip_cpu.pzc \
+  --dims 127 127 127 --dtype uint16 --backend cpu --quality-level lossless --ratio-level high
+
+# decompress (shape, dtype, codec and preprocessing are read from the container)
+python examples/photonzip_cli.py --mode decompress \
+  --input /tmp/photonzip_cpu.pzc --output /tmp/photonzip_cpu_restored.u2 --backend cpu
+
+# CUDA round trip (MANS on the GPU; needs PyTorch)
+python examples/photonzip_cli.py --mode roundtrip \
+  --input testdata/u2/sfc-gi/sfc-gi_127x127x127_4096kB.u2 --output /tmp/photonzip_cuda.pzc \
+  --dims 127 127 127 --dtype uint16 --backend cuda
+
+# DCU round trip with inter-slice delta (MANS on the DCU, delta on the DCU)
+python examples/photonzip_cli.py --mode roundtrip \
+  --input scan.u2 --output scan.pzc --dims 100 2048 2048 --dtype uint16 --codec mans --backend dcu --delta
+```
+
+The CLI prints throughput for the requested mode (`compress`: compression throughput
+and ratio; `decompress`: decompression throughput; `roundtrip`: both, the ratio and an
+equality check).
+
+| Option | Values | Behaviour |
+|---|---|---|
+| `--quality-level` | `lossless` (default), `high`, `low` | only `lossless` is wired; `high`/`low` (error bound 1.0/8.0) are rejected |
+| `--throughput-level` | `high`, `low` | `high` selects `lc` |
+| `--ratio-level` | `high`, `low` | `high` selects MANS R-mode (P-mode on the DCU, with a warning) |
+| `--codec` | `mans`, `lc` | forces a codec, overriding the levels; default `mans` |
+| `--backend` | `cpu`, `cuda`, `dcu` | compress: `dcu` for MANS in DCU builds, else `cpu`; decompress: the backend recorded in the file if the build has it, else `cpu`. LC runs on `cpu`/`dcu` |
+| `--no-warmup` | | include the one-time GPU/DCU start-up (~50 ms on a DCU) in the timings |
+| `--delta` | | inter-slice delta before compression (uint16), see "Delta preprocessing" |
+| `--delta-backend` | `cpu`, `dcu`, `numpy` | where `--delta` and its inverse run; default `dcu` when the codec runs on the DCU and the data has 2+ dimensions (the delta output then stays in DCU memory), else `cpu`. The container is the same either way |
+
+For MANS on `cpu`/`cuda`, the CLI reuses `build/best_threads.csv` if it exists;
+otherwise it runs MANS autotune once and writes that CSV. The DCU needs no thread
+table.
+
+`--dims` is the C-order shape (slowest dimension first, 1 to 3 values). Legacy
+aliases `--level`/`--fidelity`, `--speed` and `--ratio` are accepted. Invalid
+arguments exit with status 2, runtime errors with status 1. `--delta` stores the
+differences with the `offset` encoding for MANS and `int16` for LC.
+
+Throughputs are raw bytes / time. `compress` and `decompress` time the codec
+alone, including the copy of the compressed stream between device and host (with
+`--backend cuda` the raw input is copied to the GPU before timing starts, as
+upstream). With `--delta` the CLI also prints `delta` / `inverse_delta` (seconds)
+and `compress_with_delta` / `decompress_with_delta`, which include them. With the
+DCU delta the codec reads its input from (or writes its output to) DCU memory, so
+the host <-> DCU copy of the raw data is counted in the delta time.
+
+The `.pzc` container is `b"PZC1"`, a little-endian uint64 metadata length,
+UTF-8 JSON metadata (`codec`, `backend`, `dtype`, `shape`, `codec_params`,
+`preprocess`), then the codec payload.
+
+More examples are in [`examples`](./examples) (MANS autotune, CPU/CUDA round trips,
+HDF5).
+
+### Python API
+
+```python
+import numpy as np
+import photonzip
+import photonzip.codec.mans as mans
+from photonzip.preprocess import apply_delta, invert_delta
+
+volume = np.fromfile("scan.u2", dtype=np.uint16).reshape(127, 127, 127)
+photonzip.available_backends()        # e.g. ['cpu', 'cuda'] or ['cpu', 'dcu']
+
+# MANS on the CPU with an autotuned thread table
+table = mans.autotune(mans.MansAutotuneOptions()).thread_table
+packed = photonzip.compress(volume, codec="mans", backend="cpu",
+                            codec_options=mans.MansOptions(mode="r", thread_table=table))
+restored = np.from_dlpack(photonzip.decompress(packed, backend="cpu"))
+assert np.array_equal(restored, volume)
+
+# MANS on CUDA (input on the host or as a CUDA tensor; the result stays on the GPU)
+packed = photonzip.compress(volume, codec="mans", backend="cuda")
+restored = photonzip.decompress(packed, backend="cuda")      # .to_host() copies it back
+
+# LC on the CPU, and in DCU builds the same LC payload on the DCU, plus MANS
+packed = photonzip.compress(volume, codec="lc", backend="cpu")
+packed = photonzip.compress(volume, codec="lc", backend="dcu")
+packed = photonzip.compress(volume, codec="mans", backend="dcu")
+restored = np.from_dlpack(photonzip.decompress(packed, backend="dcu"))
+
+# With inter-slice delta preprocessing (uint16 only)
+delta, meta = apply_delta(volume)
+packed = photonzip.compress(delta, codec="lc", backend="cpu")
+restored = invert_delta(np.from_dlpack(photonzip.decompress(packed, backend="cpu")), meta)
+assert meta["lossless"] and np.array_equal(restored, volume)
+
+payload = packed.to_bytes()
+
+# DCU builds: delta on the DCU, its output left in DCU memory and compressed there, so the
+# raw volume crosses PCIe once; only the compressed stream comes back.
+delta, meta = apply_delta(volume, encoding="offset", backend="dcu", output_on_dcu=True)
+packed = photonzip.compress(delta, codec="mans", backend="dcu").to_host()
+restored = photonzip.decompress(packed.to_device(), backend="dcu")       # stays on the DCU
+restored = invert_delta(restored, meta, output_on_dcu=False)              # NumPy array
+```
+
+`photonzip.compress(...)` defaults to `codec="mans"`. `MansOptions(mode="p"|"r")`
+selects the MANS pipeline (default `"p"`); on the CPU the ADM thread counts come
+from `adm_compress_thread`/`adm_decompress_thread`, a `thread_table`, a
+`thread_csv_path` or `$MANS_THREAD_CSV`, else 32/32 with a one-time warning.
+
+`PhotonZipArray.to_host()` copies an array (compressed or not) from DCU or CUDA
+memory to the host, `to_device()` copies it to DCU memory, `.device` says where
+it is (`"cpu"`, `"cuda"` or `"dcu"`), and `.reshape(shape)` gives an uncompressed
+array another shape without a copy, e.g. to pick the MANS geometry of a
+DCU-resident array.
+
+To decompress raw payload bytes, rebuild the array with
+`photonzip._native.compressed_from_bytes("lc", payload, "uint16", shape, "cpu")`
+and pass it to `photonzip.decompress(...)`.
+
+Tensors that already live on the GPU or DCU (PyTorch/CuPy, DLPack `kDLCUDA` or
+`kDLROCM`) are compressed in place and the results stay on the device.
+
+### Delta preprocessing
+
+`apply_delta(array, encoding="int16", backend="auto", output_on_dcu=None)` stores
+slice 0 (along axis 0) as-is and every following slice as
+`clip(x[i] - x[i-1], -32768, 32767)` in a uint16 array. The result is lossless
+iff no difference overflows int16; the returned metadata reports
+`overflow_pixels`, `lossless` and the `encoding`. `invert_delta(array, meta, ...)`
+restores the volume with a running sum modulo 2^16 (metadata without `encoding`
+means `int16`).
+
+All backends produce the same bytes:
+
+| `backend` | runs | input / output |
+|---|---|---|
+| `numpy` | NumPy reference (single thread) | host |
+| `cpu` | C++, OpenMP over the elements of a slice | host |
+| `dcu` | HIP kernel, each DCU thread walks all slices for up to 8 consecutive elements | host or DCU; host input is copied in and the result back unless `output_on_dcu=True` |
+| `auto` (default) | `dcu` for arrays in DCU memory, `cpu` otherwise | |
+
+The DCU kernel parallelises over the elements of one slice, so it suits stacks of
+2-D frames; a 1-D array (one element per slice) runs on a single DCU thread and
+belongs on the CPU.
+
+| `encoding` | stored value | use with |
+|---|---|---|
+| `int16` (default) | two's complement bit pattern (-1 -> 65535) | LC |
+| `offset` | difference + 32768 (-1 -> 32767) | MANS |
+
+MANS needs `offset`: its ADM only maps blocks whose `max - min` is below 3500 and
+codes `|value - center|`, so with `int16` any block holding both positive and
+negative differences spans ~65535 and is stored raw. On a 100 x 2048 x 2048
+tomography stack, `int16` left 2% of the blocks to ADM and MANS (ratio 1.254) did
+worse than plain ANS on the same bytes (1.473); with `offset` 99.9% of the blocks
+use ADM and MANS reaches 1.479. The CLI picks `offset` for MANS.
+
+### MANS geometry
+
+MANS indexes elements as `x + y*nx + z*nx*ny` (`nx` fastest). PhotonZip arrays and
+HDF5 chunks are C-ordered, so the codec (on every backend), the HDF5 options from
+`mans.to_hdf5_compression_opts` and both H5Z-MANS plugins pass the *last* dimension
+as `nx` (`nx = shape[-1]`, `ny = shape[-2]`, `nz` = product of the remaining
+dimensions). Passing `shape[0]` as `nx` (as upstream did) transposes the ADM tiles:
+still lossless, but e.g. a 8x512x512 volume chunk drops from ratio 1.96 to 1.48 and
+decompresses at half the speed. The geometry is stored in every MANS stream, so
+streams written with either convention decode anywhere.
+
+## HDF5 filters
+
+Building PhotonZip also creates, under `build/bin/plugins/`:
+
+- `libH5Z-MANS.so` (filter ID 32032): the vendored CPU plugin, or the DCU plugin in DCU builds
+- `libH5Z-LC.so` (filter ID 32771)
+
+Set `HDF5_PLUGIN_PATH=$PWD/build/bin/plugins` before importing `h5py`.
+
+`H5Z-LC` takes no `compression_opts`; the decoded size travels in the payload
+header. It accepts uint16 datasets. In DCU builds it runs on the DCU when one is
+present; `PHOTONZIP_LC_BACKEND=cpu|dcu|auto` overrides that. The stored chunks
+are the same either way.
+
+`H5Z-MANS` accepts uint16/uint32 datasets and derives the ADM geometry from each
+chunk (last chunk dimension as `nx`, see "MANS geometry"); it stores the geometry in
+both the filter parameters and every compressed chunk. Compression does not cross
+chunk boundaries; use the intended 3D volume as the chunk shape when cross-frame
+correlation is required. With the CPU plugin, build the parameters with
+`mans.to_hdf5_compression_opts(...)` (mode and autotuned threads). The DCU plugin
+takes `compression_opts=(0,)` (P-mode) or nothing, and stores the same parameters
+as the CPU plugin, so either plugin reads P-mode data written by the other; do not
+put both plugins on one `HDF5_PLUGIN_PATH`.
+
+```python
+import h5py
+import photonzip.codec.lc as lc
+import photonzip.codec.mans as mans
+
+with h5py.File("scan.h5", "w") as f:
+    f.create_dataset("lc", data=volume, chunks=(16, 127, 127),
+                     compression=lc.H5Z_FILTER_LC_ID)
+    f.create_dataset("mans", data=volume, chunks=(16, 127, 127),
+                     compression=mans.H5Z_FILTER_MANS_ID,
+                     compression_opts=mans.to_hdf5_compression_opts(volume, chunks=(16, 127, 127)))
+    # DCU builds: compression_opts=(mans.MANS_MODE_P,)
+```
+
+## 📊 Performance
+
+### CPU Compression Throughput
+
+![CPU compression throughput](./images/cpuTHR-CMP.png)
+
+### CPU Decompression Throughput
+
+![CPU decompression throughput](./images/cpuTHR-DECMP.png)
+
+### NV Compression Throughput
+
+![NV compression throughput](./images/gpu_cmp.png)
+
+### NV Decompression Throughput
+
+![NV decompression throughput](./images/gpu_decmp.png)
+
+### Compression Ratio
+
+![Compression Ratio](./images/CR.png)
+
+### DCU
 
 Hygon BW (gfx936, 80 CUs), DTK 26.04. All results verified against the input.
 
@@ -164,186 +437,14 @@ encoding for MANS; MANS geometry (2048, R, 2048), see "MANS geometry"):
   - `chunk` (the delta restarts in every chunk, chunks decode independently,
     ratio 1.458): 14.5 / 15.5 GB/s.
 
-### MANS geometry
-
-MANS indexes elements as `x + y*nx + z*nx*ny` (`nx` fastest). PhotonZip arrays and
-HDF5 chunks are C-ordered, so the codec and the H5Z-MANS filter pass the *last*
-dimension as `nx` (`nx = shape[-1]`, `ny = shape[-2]`, `nz = shape[-3]`). Passing
-`shape[0]` as `nx` (as the upstream H5Z-MANS plugin does) transposes the ADM tiles:
-still lossless, but e.g. a 8x512x512 volume chunk drops from ratio 1.96 to 1.48
-and decompresses at half the speed. The geometry is stored in every MANS stream,
-so streams written with either convention decode anywhere.
-
 ### Known limitations (DCU)
 
-- MANS runs in P-mode only; R-mode datasets cannot be decoded on the DCU.
+- MANS runs in P-mode only; R-mode streams cannot be decoded on the DCU (use the CPU).
 - MANS does not fall back to raw storage, so incompressible data expands.
-- One MANS stream holds at most 4 GiB of raw data.
+- One MANS stream from the DCU holds at most 4 GiB of raw data.
 - DTK's compiler reports spurious `-Wreturn-type` warnings for `void` functions.
 - The MANS DCU sources carry local performance patches (stream format unchanged);
   see `3rdparty/lossless/MANS/VENDORED.md`.
-
-To build the HDF5 plugin on its own:
-
-```bash
-cmake -S . -B build -DPHOTONZIP_BUILD_PYTHON=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-# -> build/bin/plugins/libH5Z-LC.so
-```
-
-## Python API
-
-```python
-import numpy as np
-import photonzip
-from photonzip.preprocess import apply_delta, invert_delta
-
-volume = np.fromfile("scan.u2", dtype=np.uint16).reshape(127, 127, 127)
-
-packed = photonzip.compress(volume, codec="lc", backend="cpu")
-restored = np.from_dlpack(photonzip.decompress(packed, backend="cpu"))
-assert np.array_equal(restored, volume)
-
-# DCU builds: same LC payload on the DCU, plus MANS.
-packed = photonzip.compress(volume, codec="lc", backend="dcu")
-packed = photonzip.compress(volume, codec="mans", backend="dcu")
-restored = np.from_dlpack(photonzip.decompress(packed, backend="dcu"))
-
-# With inter-slice delta preprocessing (uint16 only).
-delta, meta = apply_delta(volume)
-packed = photonzip.compress(delta, codec="lc", backend="cpu")
-restored = invert_delta(np.from_dlpack(photonzip.decompress(packed, backend="cpu")), meta)
-assert meta["lossless"] and np.array_equal(restored, volume)
-
-payload = packed.to_bytes()
-
-# DCU builds: delta on the DCU, its output left in DCU memory and compressed there, so the
-# raw volume crosses PCIe once; only the compressed stream comes back.
-delta, meta = apply_delta(volume, encoding="offset", backend="dcu", output_on_dcu=True)
-packed = photonzip.compress(delta, codec="mans", backend="dcu").to_host()
-restored = photonzip.decompress(packed.to_device(), backend="dcu")       # stays on the DCU
-restored = invert_delta(restored, meta, output_on_dcu=False)              # NumPy array
-```
-
-`PhotonZipArray.to_host()` / `to_device()` copy an array (compressed or not)
-between host and DCU memory, `.device` says where it is (`"cpu"` or `"dcu"`),
-and `.reshape(shape)` gives an uncompressed array another shape without a copy,
-e.g. to pick the MANS geometry of a DCU-resident array.
-
-To decompress raw payload bytes, rebuild the array with
-`photonzip._native.compressed_from_bytes("lc", payload, "uint16", shape, "cpu")`
-and pass it to `photonzip.decompress(...)`.
-
-### Delta preprocessing
-
-`apply_delta(array, encoding="int16", backend="auto", output_on_dcu=None)` stores
-slice 0 (along axis 0) as-is and every following slice as
-`clip(x[i] - x[i-1], -32768, 32767)` in a uint16 array. The result is lossless
-iff no difference overflows int16; the returned metadata reports
-`overflow_pixels`, `lossless` and the `encoding`. `invert_delta(array, meta, ...)`
-restores the volume with a running sum modulo 2^16 (metadata without `encoding`
-means `int16`).
-
-All backends produce the same bytes:
-
-| `backend` | runs | input / output |
-|---|---|---|
-| `numpy` | NumPy reference (single thread) | host |
-| `cpu` | C++, OpenMP over the elements of a slice | host |
-| `dcu` | HIP kernel, each DCU thread walks all slices for up to 8 consecutive elements | host or DCU; host input is copied in and the result back unless `output_on_dcu=True` |
-| `auto` (default) | `dcu` for arrays in DCU memory, `cpu` otherwise | |
-
-The DCU kernel parallelises over the elements of one slice, so it suits stacks of
-2-D frames; a 1-D array (one element per slice) runs on a single DCU thread and
-belongs on the CPU.
-
-| `encoding` | stored value | use with |
-|---|---|---|
-| `int16` (default) | two's complement bit pattern (-1 -> 65535) | LC |
-| `offset` | difference + 32768 (-1 -> 32767) | MANS |
-
-MANS needs `offset`: its ADM only maps blocks whose `max - min` is below 3500 and
-codes `|value - center|`, so with `int16` any block holding both positive and
-negative differences spans ~65535 and is stored raw. On a 100 x 2048 x 2048
-tomography stack, `int16` left 2% of the blocks to ADM and MANS (ratio 1.254) did
-worse than plain ANS on the same bytes (1.473); with `offset` 99.9% of the blocks
-use ADM and MANS reaches 1.479. The CLI picks `offset` for `--codec mans`.
-
-## CLI
-
-```bash
-# compress
-python3 examples/photonzip_cli.py --mode compress \
-  --input scan.u2 --output scan.pzc --dims 127 127 127 --dtype uint16 --delta
-
-# decompress (shape, dtype and preprocessing are read from the container)
-python3 examples/photonzip_cli.py --mode decompress --input scan.pzc --output scan.out.u2
-
-# compress + decompress in memory, report throughput, ratio and is_equal
-python3 examples/photonzip_cli.py --mode roundtrip \
-  --input scan.u2 --output scan.pzc --dims 127 127 127 --dtype uint16 --delta
-```
-
-Compression levels select the codec and are kept for codecs added later:
-
-| Option | Values | Current behaviour |
-|---|---|---|
-| `--quality-level` | `lossless` (default), `high`, `low` | only `lossless` is wired; `high`/`low` (error bound 1.0/8.0) are rejected |
-| `--throughput-level` | `high`, `low` | both select `lc` |
-| `--ratio-level` | `high`, `low` | no effect yet (prints a warning); use `--codec` |
-| `--codec` | `lc`, `mans` | forces a codec, overriding the levels |
-| `--backend` | `cpu`, `dcu` | compress: `dcu` for `--codec mans`, else `cpu`; decompress: the backend recorded in the file (`dcu` for MANS) |
-| `--no-warmup` | | include the one-time DCU start-up (~50 ms) in the timings |
-| `--delta-backend` | `cpu`, `dcu`, `numpy` | where `--delta` and its inverse run; default `dcu` when the codec runs on the DCU and the data has 2+ dimensions (the delta output then stays in DCU memory), else `cpu`. The container is the same either way |
-
-`--dims` is the C-order shape (slowest dimension first, 1 to 3 values). Legacy
-aliases `--level`/`--fidelity`, `--speed` and `--ratio` are accepted. Invalid
-arguments exit with status 2, runtime errors with status 1. `--delta` stores the
-differences with the `offset` encoding for MANS and `int16` for LC (see "Delta
-preprocessing").
-
-Throughputs are raw bytes / time. `compress` and `decompress` time the codec
-alone; with `--delta` the CLI also prints `delta` / `inverse_delta` (seconds) and
-`compress_with_delta` / `decompress_with_delta`, which include them. With the DCU
-delta the codec reads its input from (or writes its output to) DCU memory, so the
-host <-> DCU copy of the raw data is counted in the delta time.
-
-The `.pzc` container is `b"PZC1"`, a little-endian uint64 metadata length,
-UTF-8 JSON metadata (`codec`, `backend`, `dtype`, `shape`, `codec_params`,
-`preprocess`), then the codec payload.
-
-Tensors that already live on the DCU (e.g. PyTorch on DTK, DLPack device
-`kDLROCM`) are compressed in place and the results stay on the device.
-
-## HDF5 filters
-
-`H5Z-LC` takes no `compression_opts`; the decoded size travels in the payload
-header. It accepts uint16 datasets. In DCU builds it runs on the DCU when one is
-present; `PHOTONZIP_LC_BACKEND=cpu|dcu|auto` overrides that. The stored chunks
-are the same either way.
-
-`H5Z-MANS` (DCU builds) accepts uint16/uint32 datasets and takes the ADM geometry
-from the chunk shape (last chunk dimension as `nx`, see "MANS geometry"). Pass `compression_opts=(0,)` (P-mode) or nothing. It
-stores the same parameters as the upstream MANS plugin, so the upstream CPU
-plugin can read the data; do not put both plugins on one `HDF5_PLUGIN_PATH`.
-
-```bash
-export HDF5_PLUGIN_PATH=$PWD/build/bin/plugins
-```
-
-```python
-import h5py
-import photonzip.codec.lc as lc
-
-with h5py.File("scan.h5", "w") as f:
-    f.create_dataset("data", data=volume, chunks=(16, 127, 127),
-                     compression=lc.H5Z_FILTER_LC_ID)
-
-import photonzip.codec.mans as mans  # DCU builds
-with h5py.File("scan_mans.h5", "w") as f:
-    f.create_dataset("data", data=volume, chunks=(16, 127, 127),
-                     compression=mans.H5Z_FILTER_MANS_ID, compression_opts=(0,))
-```
 
 ## LC payload format
 
@@ -353,7 +454,19 @@ uint16[n]      compressed size of each 16 KiB chunk (n = ceil(size / 16384))
 bytes          concatenated chunk payloads
 ```
 
+## 🧾 Citation
+
+- [MANS](https://doi.org/10.1145/3712285.3759825)
+
+## 🕰️ History
+
+- `2026-10-24`: Merged upstream PhotonZip (MANS CPU/CUDA, autotune) with the DCU backend; MANS vendored at hpdps-group/MANS 32793bc.
+- `2026-10-08`: DCU backend (LC and MANS), delta preprocessing, HDF5 filters with DCU support.
+- `2026-04-12`: Add HDF5 Python support for MANS.
+- `2026-04-03`: Integrated MANS CPU and GPU paths into the tensor-first Python framework.
+
 ## License
 
-BSD 3-Clause (see `LICENSE`). The LC framework components under
-`3rdparty/lossless/lc` carry their own BSD 3-Clause notice.
+BSD 3-Clause (see `LICENSE`). The vendored components under `3rdparty/` carry
+their own notices (`3rdparty/lossless/lc`: BSD 3-Clause; `3rdparty/lossless/MANS`:
+see its `LICENSE`).

@@ -21,6 +21,10 @@
 #include "photonzip/core/dcu_runtime.hpp"
 #endif
 
+#ifdef MANS_ENABLE_NV
+#include <cuda_runtime.h>
+#endif
+
 namespace py = pybind11;
 
 namespace photonzip {
@@ -424,6 +428,15 @@ void delete_dlpack_tensor(DLManagedTensor* tensor) {
 }
 
 py::capsule to_dlpack_capsule(const PhotonZipArray& array) {
+#ifdef MANS_ENABLE_NV
+  if (array.state().logical.memory_kind == MemoryKind::kCuda) {
+    const cudaError_t status = cudaDeviceSynchronize();
+    if (status != cudaSuccess) {
+      throw Error(std::string("cudaDeviceSynchronize failed: ") + cudaGetErrorString(status));
+    }
+  }
+#endif
+
   auto tensor = new DLManagedTensor{};
   auto* context = new DLPackExportContext{};
   context->state = array.shared_state();
@@ -457,6 +470,17 @@ py::bytes buffer_to_py_bytes(const Buffer& buffer) {
   if (buffer.memory_kind == MemoryKind::kHost) {
     return py::bytes(reinterpret_cast<const char*>(buffer.bytes()), buffer.size);
   }
+#ifdef MANS_ENABLE_NV
+  if (buffer.memory_kind == MemoryKind::kCuda) {
+    std::string host_copy(buffer.size, '\0');
+    const cudaError_t status = cudaMemcpy(
+        host_copy.data(), buffer.bytes(), buffer.size, cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+      throw Error(std::string("cudaMemcpy D2H failed: ") + cudaGetErrorString(status));
+    }
+    return py::bytes(host_copy);
+  }
+#endif
 #ifdef PHOTONZIP_ENABLE_DCU
   if (buffer.memory_kind == MemoryKind::kDcu) {
     std::string host(buffer.size, '\0');
@@ -674,7 +698,8 @@ std::pair<py::object, std::uint64_t> run_delta(py::object input, const std::stri
   return {py::cast(PhotonZipArray(make_plain_state(std::move(output), std::move(shape)))), clipped};
 }
 
-// Copy of `array` (compressed or not) in host or DCU memory; the metadata is unchanged.
+// Copy of `array` (compressed or not) in host or DCU memory (CUDA arrays can be copied to the
+// host); the metadata is unchanged.
 PhotonZipArray copy_to_memory(const PhotonZipArray& array, MemoryKind target) {
   const auto& state = array.state();
   if (state.buffer.memory_kind == target) {
@@ -684,7 +709,18 @@ PhotonZipArray copy_to_memory(const PhotonZipArray& array, MemoryKind target) {
   const std::size_t size = state.buffer.size;
   {
     py::gil_scoped_release release;
-    if (target == MemoryKind::kHost && state.buffer.memory_kind == MemoryKind::kDcu) {
+    if (target == MemoryKind::kHost && state.buffer.memory_kind == MemoryKind::kCuda) {
+#ifdef MANS_ENABLE_NV
+      copy->buffer = make_host_buffer(size);
+      const cudaError_t status = cudaMemcpy(
+          copy->buffer.mutable_bytes(), state.buffer.bytes(), size, cudaMemcpyDeviceToHost);
+      if (status != cudaSuccess) {
+        throw Error(std::string("cudaMemcpy D2H failed: ") + cudaGetErrorString(status));
+      }
+#else
+      throw Error("This PhotonZip build has no CUDA backend.");
+#endif
+    } else if (target == MemoryKind::kHost && state.buffer.memory_kind == MemoryKind::kDcu) {
 #ifdef PHOTONZIP_ENABLE_DCU
       copy->buffer = make_host_buffer(size);
       dcu::copy_device_to_host(copy->buffer.mutable_bytes(), state.buffer.bytes(), size);
@@ -732,6 +768,18 @@ PhotonZipArray reshape_array(const PhotonZipArray& array, const std::vector<std:
   view->logical.shape = shape;
   view->original.shape = shape;
   return PhotonZipArray(view);
+}
+
+// Backends compiled into this build, e.g. ["cpu", "cuda"] or ["cpu", "dcu"].
+std::vector<std::string> available_backends() {
+  std::vector<std::string> backends{"cpu"};
+#ifdef MANS_ENABLE_NV
+  backends.emplace_back("cuda");
+#endif
+#ifdef PHOTONZIP_ENABLE_DCU
+  backends.emplace_back("dcu");
+#endif
+  return backends;
 }
 
 py::object invoke_codec(const std::string& codec_name,
@@ -784,7 +832,14 @@ PYBIND11_MODULE(_native, module) {
         return photonzip::buffer_to_py_bytes(array.state().buffer);
       })
       .def_property_readonly("device", [](const photonzip::PhotonZipArray& array) {
-        return array.state().buffer.memory_kind == photonzip::MemoryKind::kDcu ? "dcu" : "cpu";
+        switch (array.state().buffer.memory_kind) {
+          case photonzip::MemoryKind::kCuda:
+            return "cuda";
+          case photonzip::MemoryKind::kDcu:
+            return "dcu";
+          default:
+            return "cpu";
+        }
       })
       .def("to_host", [](const photonzip::PhotonZipArray& array) {
         return photonzip::copy_to_memory(array, photonzip::MemoryKind::kHost);
@@ -805,6 +860,7 @@ PYBIND11_MODULE(_native, module) {
       });
 
   module.def("list_codecs", &photonzip::list_codecs);
+  module.def("available_backends", &photonzip::available_backends);
   module.def(
       "compress_tensor",
       &photonzip::compress_tensor,

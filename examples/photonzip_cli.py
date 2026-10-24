@@ -20,9 +20,13 @@ except ImportError:
 
 
 MAGIC = b"PZC1"
-LOSSLESS_CODEC = "lc"
-SUPPORTED_CODECS = ("lc", "mans")
-MANS_MAX_BYTES = (1 << 32) - 1  # one MANS stream holds at most 4 GiB of raw data
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_THREAD_CSV = REPO_ROOT / "build" / "best_threads.csv"
+LOSSLESS_CODEC = "mans"
+SUPPORTED_CODECS = ("mans", "lc")
+# Backends each codec runs on (a build has "cpu" plus "cuda" and/or "dcu").
+CODEC_BACKENDS = {"mans": ("cpu", "cuda", "dcu"), "lc": ("cpu", "dcu")}
+MANS_DCU_MAX_BYTES = (1 << 32) - 1  # one MANS stream from the DCU holds at most 4 GiB of raw data
 QUALITY_LEVEL_ERROR_BOUNDS = {
     "lossless": 0.0,
     "high": 1.0,
@@ -31,7 +35,7 @@ QUALITY_LEVEL_ERROR_BOUNDS = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="PhotonZip CLI (lossless; LC on CPU/DCU, MANS on DCU)")
+    parser = argparse.ArgumentParser(description="PhotonZip CLI (lossless; MANS on CPU/CUDA/DCU, LC on CPU/DCU)")
     parser.add_argument("--mode", required=True, choices=("compress", "decompress", "roundtrip"))
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -39,17 +43,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("uint16", "uint32"))
     parser.add_argument(
         "--backend",
-        choices=("cpu", "dcu"),
-        help="Execution backend. Default for compress/roundtrip: dcu for --codec mans, cpu otherwise; "
-        "for decompress: the backend recorded in the file (dcu for MANS, cpu if this build has no DCU). "
-        "LC payloads are identical on both backends.",
+        choices=("cpu", "cuda", "dcu"),
+        help="Execution backend. Default for compress/roundtrip: dcu for MANS in DCU builds, cpu otherwise; "
+        "for decompress: the backend recorded in the file if this build has it, cpu otherwise. "
+        "LC payloads and MANS P-mode streams decode on any backend.",
     )
     parser.add_argument(
         "--no-warmup",
         dest="warmup",
         action="store_false",
-        help="Do not initialise the DCU before timing. By default a tiny untimed call runs first, "
-        "so the reported throughput excludes the one-time DCU runtime start-up (~50 ms).",
+        help="Do not initialise the GPU/DCU before timing. By default a tiny untimed call runs first, "
+        "so the reported throughput excludes the one-time runtime start-up (~50 ms on a DCU).",
     )
     level_group = parser.add_argument_group("compression levels")
     level_group.add_argument(
@@ -60,9 +64,9 @@ def parse_args() -> argparse.Namespace:
         help="Quality level: lossless, high, or low.",
     )
     level_group.add_argument("--throughput-level", choices=("high", "low"),
-                             help="Throughput level (currently both values select lc).")
+                             help="Throughput level (high selects lc).")
     level_group.add_argument("--ratio-level", choices=("high", "low"),
-                             help="Compression-ratio level (currently has no effect; use --codec).")
+                             help="Compression-ratio level (high selects MANS R-mode on cpu/cuda).")
     parser.add_argument("--level", dest="quality_level", choices=tuple(QUALITY_LEVEL_ERROR_BOUNDS), help=argparse.SUPPRESS)
     parser.add_argument("--fidelity", dest="quality_level", choices=tuple(QUALITY_LEVEL_ERROR_BOUNDS), help=argparse.SUPPRESS)
     parser.add_argument("--speed", dest="throughput_level", choices=("high", "low"), help=argparse.SUPPRESS)
@@ -98,22 +102,26 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def dcu_available() -> bool:
-    # The MANS codec is only compiled into DCU builds.
-    return "mans" in photonzip.list_codecs()
+def available_backends() -> list[str]:
+    return photonzip.available_backends()
 
 
 def warn(message: str) -> None:
     print(f"warning: {message}", file=sys.stderr)
 
 
+def build_hint(backend: str) -> str:
+    if backend == "dcu":
+        return "configure with -DPHOTONZIP_ENABLE_DCU=ON"
+    return "build the vendored MANS with its NVIDIA backend (-DPHOTONZIP_MANS_TARGET_PLATFORM=cpu_nv)"
+
+
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if args.codec is not None and args.codec not in photonzip.list_codecs():
-        parser.error(f"codec {args.codec!r} is not available in this build (available: {photonzip.list_codecs()})")
-    if args.backend == "dcu" and not dcu_available():
-        parser.error("--backend dcu needs a DCU build (configure with -DPHOTONZIP_ENABLE_DCU=ON)")
-    if args.delta_backend == "dcu" and not dcu_available():
-        parser.error("--delta-backend dcu needs a DCU build (configure with -DPHOTONZIP_ENABLE_DCU=ON)")
+    backends = available_backends()
+    if args.backend is not None and args.backend not in backends:
+        parser.error(f"--backend {args.backend} is not available in this build ({build_hint(args.backend)})")
+    if args.delta_backend == "dcu" and "dcu" not in backends:
+        parser.error(f"--delta-backend dcu is not available in this build ({build_hint('dcu')})")
     if args.mode not in ("compress", "roundtrip"):
         return
     if not args.dims:
@@ -132,32 +140,86 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
 
     codec = select_lossless_codec(args)
     if args.backend is None:
-        args.backend = "dcu" if codec == "mans" else "cpu"
-    if codec == "mans" and args.backend != "dcu":
-        parser.error("the MANS codec runs on the DCU only; use --backend dcu")
+        args.backend = "dcu" if codec == "mans" and "dcu" in backends else "cpu"
+    if args.backend not in CODEC_BACKENDS[codec]:
+        parser.error(f"the {codec} codec runs on {', '.join(CODEC_BACKENDS[codec])}; not on --backend {args.backend}")
+    if codec == "lc" and args.dtype != "uint16":
+        parser.error("the lc codec supports --dtype uint16 only")
+    if args.backend == "cuda":
+        try:
+            import torch
+        except ImportError:
+            parser.error("--backend cuda needs PyTorch")
+        if not torch.cuda.is_available():
+            parser.error("--backend cuda was requested, but torch.cuda.is_available() is False")
     nbytes = int(np.prod(args.dims)) * np.dtype(args.dtype).itemsize
-    if codec == "mans" and nbytes > MANS_MAX_BYTES:
-        parser.error(f"one MANS stream holds at most 4 GiB of raw data ({nbytes} bytes requested)")
-    if args.codec is None and args.ratio_level is not None:
-        warn("--ratio-level has no effect yet (the default codec lc is used); choose a codec with --codec")
+    if codec == "mans" and args.backend == "dcu" and nbytes > MANS_DCU_MAX_BYTES:
+        parser.error(f"one MANS stream from the DCU holds at most 4 GiB of raw data ({nbytes} bytes requested)")
+    if codec == "mans" and args.backend == "dcu" and resolve_lossless_mans_mode(args) == "r":
+        warn("MANS R-mode (--ratio-level high) is not available on the DCU; using P-mode")
 
 
 def read_raw_array(path: Path, dtype_name: str, dims: list[int]) -> np.ndarray:
     dtype = np.dtype(dtype_name)
     shape = tuple(int(dim) for dim in dims)
+    expected_items = int(np.prod(shape, dtype=np.int64))
     array = np.fromfile(path, dtype=dtype)
-    expected = int(np.prod(shape))
-    if array.size != expected:
+    if array.size != expected_items:
         raise ValueError(
-            f"Input element count mismatch: file contains {array.size} elements, but dims imply {expected}."
+            f"Input element count mismatch for {path}: expected {expected_items}, got {array.size}."
         )
     return array.reshape(shape)
+
+
+def to_backend_tensor(array, backend: str):
+    """Host input for cuda becomes a CUDA tensor (outside the timed region, as upstream)."""
+    if backend != "cuda" or not isinstance(array, np.ndarray):
+        return array
+    import torch
+
+    return torch.from_numpy(np.ascontiguousarray(array)).cuda()
 
 
 def to_host_numpy(value) -> np.ndarray:
     if isinstance(value, np.ndarray):
         return value
     return np.from_dlpack(value)
+
+
+def resolve_thread_csv() -> Path | None:
+    if DEFAULT_THREAD_CSV.exists():
+        return DEFAULT_THREAD_CSV
+    return None
+
+
+def ensure_autotuned_csv() -> Path:
+    csv_path = resolve_thread_csv()
+    if csv_path is not None:
+        print(f"thread_csv: {csv_path}")
+        return csv_path
+
+    print(f"thread_csv_missing: {DEFAULT_THREAD_CSV}")
+    print("autotune: start")
+    result = mans.autotune(
+        mans.MansAutotuneOptions(
+            data_size_mb_list=(4.0 / 1024.0, 8.0 / 1024.0, 16.0 / 1024.0, 32.0 / 1024.0, 1.0, 4.0),
+            threads_min=1,
+            threads_max=64,
+            iter=3,
+            verbose=False,
+        )
+    )
+    DEFAULT_THREAD_CSV.parent.mkdir(parents=True, exist_ok=True)
+    result.thread_table.to_csv(DEFAULT_THREAD_CSV)
+    print(f"autotune_csv: {DEFAULT_THREAD_CSV}")
+    print(f"thread_rows: {len(result.thread_table.rows)}")
+    return DEFAULT_THREAD_CSV
+
+
+def resolve_lossless_mans_mode(args: argparse.Namespace) -> str:
+    if args.ratio_level == "high":
+        return "r"
+    return "p"
 
 
 def write_container(path: Path, *, codec: str, backend: str, dtype: str, shape: tuple[int, ...], codec_params: list[int], payload: bytes, preprocess: dict | None = None) -> None:
@@ -182,7 +244,7 @@ def read_container(path: Path) -> tuple[dict, bytes]:
     with path.open("rb") as handle:
         magic = handle.read(len(MAGIC))
         if magic != MAGIC:
-            raise ValueError(f"Unsupported file format in {path}.")
+            raise ValueError(f"{path} is not a PhotonZip container.")
         metadata_size = struct.unpack("<Q", handle.read(8))[0]
         metadata = json.loads(handle.read(metadata_size).decode("utf-8"))
         payload = handle.read()
@@ -246,6 +308,8 @@ def select_lossless_codec(args: argparse.Namespace) -> str:
         return args.codec
     if args.throughput_level == "high":
         return "lc"
+    if args.ratio_level == "high":
+        return "mans"
     return LOSSLESS_CODEC
 
 
@@ -263,7 +327,12 @@ def make_codec_options(args: argparse.Namespace, tensor) -> tuple[str, object, l
         codec_params = options.to_codec_params(tensor=tensor, backend=args.backend)
         return codec, options, codec_params
     if codec == "mans":
-        options = mans.MansOptions()
+        if args.backend == "dcu":
+            # The DCU runs P-mode only and needs no thread table.
+            options = mans.MansOptions(mode="p")
+        else:
+            csv_path = ensure_autotuned_csv()
+            options = mans.MansOptions(mode=resolve_lossless_mans_mode(args), thread_csv_path=csv_path)
         codec_params = options.to_codec_params(tensor=tensor, backend=args.backend)
         return codec, options, codec_params
 
@@ -271,12 +340,14 @@ def make_codec_options(args: argparse.Namespace, tensor) -> tuple[str, object, l
 
 
 def warm_up(args: argparse.Namespace, codec: str, delta_backend: str | None = None) -> None:
-    """Initialise the DCU runtime with tiny untimed calls so timings show steady-state speed."""
+    """Initialise the GPU/DCU runtime with tiny untimed calls so timings show steady-state speed."""
     if not args.warmup:
         return
-    if args.backend == "dcu":
+    if args.backend in ("cuda", "dcu"):
         sample = np.zeros(4096, dtype=np.uint16)
-        photonzip.decompress(photonzip.compress(sample, codec=codec, backend="dcu"), backend="dcu")
+        options = mans.MansOptions(mode="p", adm_compress_thread=32, adm_decompress_thread=32) if codec == "mans" else None
+        photonzip.decompress(photonzip.compress(sample, codec=codec, backend=args.backend, codec_options=options),
+                             backend=args.backend)
     if delta_backend == "dcu":
         sample, meta = apply_delta(np.zeros((2, 4096), dtype=np.uint16), backend="dcu")
         invert_delta(sample, meta, backend="dcu")
@@ -289,12 +360,14 @@ def compress_array(args: argparse.Namespace, array: np.ndarray):
     warm_up(args, codec, delta_backend)
     t0 = perf_counter()
     compress_input, preprocess = prepare_compress_input(args, array, delta_backend)
+    delta_elapsed = perf_counter() - t0 if delta_backend is not None else None
+    # The host->GPU copy for --backend cuda is not timed (as upstream).
+    compress_input = to_backend_tensor(compress_input, args.backend)
     t1 = perf_counter()
-    packed = photonzip.compress(compress_input, codec=codec, backend=args.backend, codec_options=codec_options)
+    packed = photonzip.compress(compress_input, codec=codec, backend=args.backend, codec_params=codec_params)
     if packed.device != "cpu":
         packed = packed.to_host()
     t2 = perf_counter()
-    delta_elapsed = t1 - t0 if delta_backend is not None else None
     return codec, packed, codec_params, preprocess, t2 - t1, delta_elapsed, delta_backend
 
 
@@ -334,14 +407,17 @@ def run_compress(args: argparse.Namespace) -> None:
 
 
 def decompress_backend(args: argparse.Namespace, metadata: dict) -> str:
+    backends = available_backends()
     if args.backend is not None:
         backend = args.backend
-    elif metadata["codec"] == "mans":
-        backend = "dcu"
     else:
-        backend = metadata.get("backend", "cpu") if dcu_available() else "cpu"
-    if metadata["codec"] == "mans" and (backend != "dcu" or not dcu_available()):
-        raise RuntimeError(f"{args.input} holds MANS data, which can only be decompressed on a DCU build with --backend dcu.")
+        recorded = metadata.get("backend", "cpu")
+        backend = recorded if recorded in backends else "cpu"
+    codec = metadata["codec"]
+    if backend not in CODEC_BACKENDS[codec]:
+        raise RuntimeError(f"the {codec} codec cannot decompress on --backend {backend}.")
+    if codec == "mans" and backend == "dcu" and metadata.get("codec_params", [0])[:1] == [mans.MANS_MODE_R]:
+        raise RuntimeError(f"{args.input} holds MANS R-mode data, which the DCU cannot decode; use --backend cpu.")
     return backend
 
 

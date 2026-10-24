@@ -10,6 +10,10 @@
 #include <variant>
 #include <vector>
 
+#ifdef MANS_ENABLE_NV
+#include <cuda_runtime.h>
+#endif
+
 namespace photonzip {
 
 enum class Backend {
@@ -70,6 +74,30 @@ inline Buffer make_host_buffer(std::size_t size) {
       static_cast<void*>(new std::uint8_t[size]),
       [](void* ptr) { delete[] static_cast<std::uint8_t*>(ptr); });
   return buffer;
+}
+
+inline Buffer make_cuda_buffer(std::size_t size) {
+  Buffer buffer;
+  buffer.size = size;
+  buffer.memory_kind = MemoryKind::kCuda;
+  if (size == 0) {
+    return buffer;
+  }
+#ifdef MANS_ENABLE_NV
+  void* ptr = nullptr;
+  const cudaError_t status = cudaMalloc(&ptr, size);
+  if (status != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaMalloc failed: ") + cudaGetErrorString(status));
+  }
+  buffer.data = std::shared_ptr<void>(ptr, [](void* raw_ptr) {
+    if (raw_ptr) {
+      cudaFree(raw_ptr);
+    }
+  });
+  return buffer;
+#else
+  throw std::runtime_error("CUDA buffers require MANS_ENABLE_NV.");
+#endif
 }
 
 struct CodecValue;

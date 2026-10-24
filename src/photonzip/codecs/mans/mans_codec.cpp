@@ -2,15 +2,91 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
+#include "mans_api.hpp"
+#include "photonzip/core/codec_value_utils.hpp"
+
+#ifdef MANS_ENABLE_NV
+#include <cuda_runtime.h>
+#endif
+
+#ifdef PHOTONZIP_ENABLE_DCU
 #include "dcu/mans_dcu.h"
-#include "mans_defs.h"
 #include "photonzip/core/dcu_runtime.hpp"
+#endif
 
 namespace photonzip {
 namespace {
+
+enum class MansMode {
+  kP = 0,
+  kR = 1,
+};
+
+enum MansCodecParamIndex : std::size_t {
+  kMode = 0,
+  kAdmCompressThread = 1,
+  kAdmDecompressThread = 2,
+};
+
+mans::MansAutotuneOptions parse_autotune_options(const CodecInvokeRequest& request) {
+  using namespace photonzip::codec_value;
+  mans::MansAutotuneOptions options;
+  const CodecDict& args = request.args;
+
+  options.data_size_mb_list = parse_double_list(args, "data_size_mb_list", options.data_size_mb_list);
+  options.dims_list = parse_u32_list(args, "dims_list", options.dims_list);
+  options.threads_min = static_cast<int>(parse_scalar<std::int64_t>(args, "threads_min", options.threads_min, expect_int));
+  options.threads_max = static_cast<int>(parse_scalar<std::int64_t>(args, "threads_max", options.threads_max, expect_int));
+  options.stride = static_cast<int>(parse_scalar<std::int64_t>(args, "stride", options.stride, expect_int));
+  options.iter = static_cast<std::uint32_t>(parse_scalar<std::int64_t>(args, "iter", options.iter, expect_int));
+  options.verbose = parse_scalar<bool>(args, "verbose", options.verbose, expect_bool);
+
+  return options;
+}
+
+CodecValue encode_autotune_result(const mans::MansAutotuneOptions& options) {
+  CodecList sweep_rows;
+  sweep_rows.reserve(options.sweep_rows.size());
+  for (const auto& row : options.sweep_rows) {
+    CodecDict item;
+    item.emplace("chunk_elements", static_cast<std::int64_t>(row.chunk_elements));
+    item.emplace("dims", static_cast<std::int64_t>(row.dims));
+    item.emplace("mode", row.mode);
+    item.emplace("threads", static_cast<std::int64_t>(row.threads));
+    item.emplace("throughput_mbps", row.throughput_mbps);
+    sweep_rows.emplace_back(std::move(item));
+  }
+
+  CodecList best_configs;
+  best_configs.reserve(options.best_configs.size());
+  for (const auto& row : options.best_configs) {
+    CodecDict item;
+    item.emplace("chunk_elements", static_cast<std::int64_t>(row.chunk_elements));
+    item.emplace("dims", static_cast<std::int64_t>(row.dims));
+    item.emplace("compress_thread", static_cast<std::int64_t>(row.compress_thread));
+    item.emplace("decompress_thread", static_cast<std::int64_t>(row.decompress_thread));
+    best_configs.emplace_back(std::move(item));
+  }
+
+  CodecDict result;
+  result.emplace("sweep_rows", std::move(sweep_rows));
+  result.emplace("best_configs", std::move(best_configs));
+  return result;
+}
+
+CodecValue invoke_mans_operation(const CodecInvokeRequest& request) {
+  if (request.op_name == "autotune") {
+    auto options = parse_autotune_options(request);
+    mans::autotune(options);
+    return encode_autotune_result(options);
+  }
+
+  throw std::runtime_error("Unsupported MANS codec operation: " + request.op_name);
+}
 
 std::size_t bytes_per_element(DataType dtype) {
   switch (dtype) {
@@ -23,65 +99,216 @@ std::size_t bytes_per_element(DataType dtype) {
   }
 }
 
-void ensure_dcu_backend(const CodecOptions& options) {
-  if (options.backend != Backend::kDcu) {
-    throw std::runtime_error("MANS codec only supports the DCU backend.");
-  }
+#ifndef PHOTONZIP_ENABLE_DCU
+[[noreturn]] void throw_no_dcu() {
+  throw std::runtime_error(
+      "This PhotonZip build has no DCU backend (configure with -DPHOTONZIP_ENABLE_DCU=ON).");
+}
+#endif
+
+std::uint32_t codec_param_or(const CodecOptions& options,
+                             std::size_t index,
+                             std::uint32_t fallback) {
+  return index < options.codec_params.size() ? options.codec_params[index] : fallback;
 }
 
 // MANS indexes elements as x + y * nx + z * nx * ny, so nx must be the fastest-varying
 // dimension. PhotonZip tensors are C-contiguous, so that is the last axis: nx = shape[-1],
 // ny = shape[-2], nz = shape[-3]. (Passing shape[0] as nx transposes the ADM tiles; it stays
-// lossless but costs ratio, e.g. 1.96 -> 1.48 on an 8x512x512 volume chunk.)
-mans::MansParams to_mans_params(const CodecOptions& options, std::size_t element_count) {
-  if (options.shape.empty() || options.shape.size() > 3) {
-    throw std::runtime_error("MANS requires a tensor with 1 to 3 dimensions.");
-  }
-  std::size_t product = 1;
-  for (const auto dim : options.shape) {
-    if (dim == 0) {
-      throw std::runtime_error("MANS requires positive shape values.");
-    }
-    product *= static_cast<std::size_t>(dim);
-  }
-  if (element_count != 0 && product != element_count) {
-    throw std::runtime_error("MANS requires the shape product to match the element count.");
-  }
-
+// lossless but costs ratio, e.g. 1.96 -> 1.48 on an 8x512x512 volume chunk.) The geometry is
+// stored in the stream header, so decompression does not depend on it.
+mans::MansParams to_mans_params(const CodecOptions& options) {
   mans::MansParams params;
-  params.backend = mans::Backend::DCU;
+  switch (options.backend) {
+    case Backend::kCpu:
+      params.backend = mans::Backend::CPU;
+      break;
+    case Backend::kCuda:
+      params.backend = mans::Backend::NVIDIA;
+      break;
+    case Backend::kDcu:
+      params.backend = mans::Backend::DCU;
+      break;
+  }
   params.dtype = options.dtype == DataType::kUInt32 ? mans::DataType::U32 : mans::DataType::U16;
-  params.mode = mans::Mode::P;  // the DCU backend implements P-mode only
+  // Without codec parameters the CPU/CUDA backends default to R-mode (as upstream); the DCU
+  // backend implements P-mode only.
+  const auto default_mode = options.backend == Backend::kDcu ? MansMode::kP : MansMode::kR;
+  const auto mans_mode = codec_param_or(options, kMode, static_cast<std::uint32_t>(default_mode));
+  params.mode = mans_mode == static_cast<std::uint32_t>(MansMode::kP) ? mans::Mode::P : mans::Mode::R;
   const std::size_t rank = options.shape.size();
   params.dims = static_cast<std::uint32_t>(rank);
-  params.nx = options.shape[rank - 1];
+  params.nx = rank >= 1 ? options.shape[rank - 1] : 0;
   params.ny = rank >= 2 ? options.shape[rank - 2] : 0;
   params.nz = rank >= 3 ? options.shape[rank - 3] : 0;
+  params.adm_compress_thread = codec_param_or(options, kAdmCompressThread, 32);
+  params.adm_decompress_thread = codec_param_or(options, kAdmDecompressThread, 32);
   return params;
 }
 
-std::size_t element_count_for(std::size_t nbytes, const CodecOptions& options) {
-  const std::size_t width = bytes_per_element(options.dtype);
+std::size_t infer_element_count(std::size_t nbytes, const CodecOptions& options) {
+  if (options.element_count != 0) {
+    return options.element_count;
+  }
+
+  const auto width = bytes_per_element(options.dtype);
   if (nbytes % width != 0) {
-    throw std::runtime_error("MANS input size is not a multiple of the element size.");
+    throw std::runtime_error("Input size is not aligned with the requested dtype.");
   }
   return nbytes / width;
 }
 
-std::size_t decompressed_bytes(const InputBuffer& input, const mans::MansParams& params) {
+CodecOptions normalize_compress_options(std::size_t nbytes, const CodecOptions& options) {
+  CodecOptions normalized = options;
+  normalized.element_count = infer_element_count(nbytes, options);
+
+  if (normalized.shape.empty() || normalized.shape.size() > 3) {
+    throw std::runtime_error("MANS compression requires shape rank to be between 1 and 3.");
+  }
+
+  std::size_t dims_product = 1;
+  for (const auto dim : normalized.shape) {
+    if (dim == 0) {
+      throw std::runtime_error("MANS compression requires positive shape values.");
+    }
+    dims_product *= static_cast<std::size_t>(dim);
+  }
+  if (dims_product != normalized.element_count) {
+    throw std::runtime_error("MANS compression requires shape product to match the element count.");
+  }
+  return normalized;
+}
+
+std::size_t max_compressed_bytes(std::size_t element_count, const mans::MansParams& params) {
+  if (params.backend == mans::Backend::DCU) {
+#ifdef PHOTONZIP_ENABLE_DCU
+    return mans::dcu::get_max_compress_bytes(element_count, params);
+#else
+    throw_no_dcu();
+#endif
+  }
+  return mans::get_mans_max_compress_bytes(element_count, params);
+}
+
+#ifdef MANS_ENABLE_NV
+Buffer compress_cuda(const InputBuffer& input,
+                     std::size_t element_count,
+                     const mans::MansParams& params,
+                     std::size_t output_capacity) {
+  Buffer output = make_cuda_buffer(output_capacity);
+  std::size_t output_size = output.size;
+
+  if (input.memory_kind == MemoryKind::kCuda) {
+    mans::compress_device(input.data, element_count, params, output.mutable_bytes(), output_size);
+  } else if (input.memory_kind == MemoryKind::kHost) {
+    const auto input_bytes = element_count * bytes_per_element(params.dtype == mans::DataType::U32 ? DataType::kUInt32 : DataType::kUInt16);
+    void* d_input = nullptr;
+    const cudaError_t alloc_status = cudaMalloc(&d_input, input_bytes);
+    if (alloc_status != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaMalloc failed: ") + cudaGetErrorString(alloc_status));
+    }
+    try {
+      const cudaError_t copy_status = cudaMemcpy(d_input, input.data, input_bytes, cudaMemcpyHostToDevice);
+      if (copy_status != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaMemcpy H2D failed: ") + cudaGetErrorString(copy_status));
+      }
+      mans::compress_device(d_input, element_count, params, output.mutable_bytes(), output_size);
+    } catch (...) {
+      cudaFree(d_input);
+      throw;
+    }
+    cudaFree(d_input);
+  } else {
+    throw std::runtime_error("Unsupported input memory kind.");
+  }
+
+  if (output_size == 0) {
+    throw std::runtime_error("MANS compression returned an empty payload. Check dims and input characteristics.");
+  }
+  output.size = output_size;
+  return output;
+}
+#endif
+
+#ifdef PHOTONZIP_ENABLE_DCU
+// DCU backend: host input yields a host payload, device input yields a device payload.
+Buffer compress_dcu(const InputBuffer& input,
+                    std::size_t element_count,
+                    const mans::MansParams& params,
+                    std::size_t output_capacity) {
+  Buffer output;
+  std::size_t output_size = output_capacity;
+  if (input.memory_kind == MemoryKind::kDcu) {
+    output = dcu::make_device_buffer(output_capacity);
+    mans::dcu::compress_internal_device(input.data, element_count, params, output.mutable_bytes(), output_size);
+  } else if (input.memory_kind == MemoryKind::kHost) {
+    output = make_host_buffer(output_capacity);
+    mans::dcu::compress_internal(input.data, element_count, params, output.mutable_bytes(), output_size);
+  } else {
+    throw std::runtime_error("Unsupported input memory kind for the MANS DCU backend.");
+  }
+  if (output_size == 0) {
+    throw std::runtime_error("MANS compression produced an empty payload.");
+  }
+  output.size = output_size;
+  return output;
+}
+
+Buffer decompress_dcu(const InputBuffer& input, const mans::MansParams& params) {
   if (input.size <= mans::kMansHeaderBytes) {
     throw std::runtime_error("MANS compressed payload is missing its header or body.");
   }
-  if (input.memory_kind == MemoryKind::kHost) {
-    return mans::dcu::get_exact_decompress_bytes(input.data, input.size, params);
-  }
+  std::size_t raw_bytes = 0;
   if (input.memory_kind == MemoryKind::kDcu) {
     // get_exact_decompress_bytes only parses the header, but it checks that a body follows.
     std::uint8_t header[mans::kMansHeaderBytes + 1] = {};
     dcu::copy_device_to_host(header, input.data, mans::kMansHeaderBytes);
-    return mans::dcu::get_exact_decompress_bytes(header, input.size, params);
+    raw_bytes = mans::dcu::get_exact_decompress_bytes(header, input.size, params);
+  } else if (input.memory_kind == MemoryKind::kHost) {
+    raw_bytes = mans::dcu::get_exact_decompress_bytes(input.data, input.size, params);
+  } else {
+    throw std::runtime_error("Unsupported input memory kind for the MANS DCU backend.");
   }
-  throw std::runtime_error("Unsupported input memory kind for MANS.");
+
+  Buffer output;
+  std::size_t output_size = raw_bytes;
+  if (input.memory_kind == MemoryKind::kDcu) {
+    output = dcu::make_device_buffer(raw_bytes);
+    mans::dcu::decompress_internal_device(input.data, input.size, params, output.mutable_bytes(), output_size);
+  } else {
+    output = make_host_buffer(raw_bytes);
+    mans::dcu::decompress_internal(input.data, input.size, params, output.mutable_bytes(), output_size);
+  }
+  if (output_size != raw_bytes) {
+    throw std::runtime_error("MANS decompression size mismatch.");
+  }
+  output.size = output_size;
+  return output;
+}
+#endif
+
+std::size_t query_decompressed_bytes(const InputBuffer& input,
+                                     const mans::MansParams& params) {
+  if (input.memory_kind == MemoryKind::kHost) {
+    return mans::get_mans_exact_decompress_bytes(input.data, input.size, params);
+  }
+
+#ifdef MANS_ENABLE_NV
+  if (input.memory_kind == MemoryKind::kCuda) {
+    if (input.size <= mans::kMansHeaderBytes) {
+      throw std::runtime_error("MANS compressed payload is missing the header or body.");
+    }
+    std::vector<std::uint8_t> header_copy(mans::kMansHeaderBytes + 1);
+    const cudaError_t status = cudaMemcpy(
+        header_copy.data(), input.data, header_copy.size(), cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaMemcpy D2H header failed: ") + cudaGetErrorString(status));
+    }
+    return mans::get_mans_exact_decompress_bytes(header_copy.data(), input.size, params);
+  }
+#endif
+
+  throw std::runtime_error("Unsupported input memory kind.");
 }
 
 }  // namespace
@@ -91,67 +318,128 @@ CodecVTable make_mans_codec() {
   codec.name = "mans";
 
   codec.max_compress_size = [](std::size_t input_nbytes, const CodecOptions& options) -> std::size_t {
-    const std::size_t n = element_count_for(input_nbytes, options);
-    return mans::dcu::get_max_compress_bytes(n, to_mans_params(options, n));
+    const auto normalized = normalize_compress_options(input_nbytes, options);
+    return max_compressed_bytes(normalized.element_count, to_mans_params(normalized));
   };
 
-  codec.query_decompressed_size = [](const void* data, std::size_t nbytes,
-                                     const CodecOptions& options) -> std::size_t {
-    return mans::dcu::get_exact_decompress_bytes(data, nbytes, to_mans_params(options, 0));
+  codec.query_decompressed_size = [](const void* data, std::size_t nbytes, const CodecOptions& options) -> std::size_t {
+    const auto params = to_mans_params(options);
+    if (params.backend == mans::Backend::DCU) {
+#ifdef PHOTONZIP_ENABLE_DCU
+      return mans::dcu::get_exact_decompress_bytes(data, nbytes, params);
+#else
+      throw_no_dcu();
+#endif
+    }
+    return mans::get_mans_exact_decompress_bytes(data, nbytes, params);
   };
 
   codec.compress = [](const InputBuffer& input, const CodecOptions& options) -> Buffer {
-    ensure_dcu_backend(options);
-    const std::size_t n = element_count_for(input.size, options);
-    const mans::MansParams params = to_mans_params(options, n);
-    const std::size_t capacity = mans::dcu::get_max_compress_bytes(n, params);
+    const auto normalized = normalize_compress_options(input.size, options);
+    const auto params = to_mans_params(normalized);
+    const std::size_t capacity = max_compressed_bytes(normalized.element_count, params);
 
-    Buffer output;
-    if (input.memory_kind == MemoryKind::kDcu) {
-      output = dcu::make_device_buffer(capacity);
-      std::size_t out_size = capacity;
-      mans::dcu::compress_internal_device(input.data, n, params, output.mutable_bytes(), out_size);
-      output.size = out_size;
-    } else if (input.memory_kind == MemoryKind::kHost) {
-      output = make_host_buffer(capacity);
-      std::size_t out_size = capacity;
-      mans::dcu::compress_internal(input.data, n, params, output.mutable_bytes(), out_size);
-      output.size = out_size;
-    } else {
-      throw std::runtime_error("Unsupported input memory kind for MANS.");
+    if (options.backend == Backend::kDcu) {
+#ifdef PHOTONZIP_ENABLE_DCU
+      if (params.mode != mans::Mode::P) {
+        throw std::runtime_error("The MANS DCU backend implements P-mode only.");
+      }
+      return compress_dcu(input, normalized.element_count, params, capacity);
+#else
+      throw_no_dcu();
+#endif
     }
-    if (output.size == 0) {
-      throw std::runtime_error("MANS compression produced an empty payload.");
+
+    if (options.backend == Backend::kCpu) {
+      if (input.memory_kind != MemoryKind::kHost) {
+        throw std::runtime_error("The MANS CPU backend only supports host buffers.");
+      }
+      Buffer output = make_host_buffer(capacity);
+      std::size_t output_size = output.size;
+      mans::compress(input.data, normalized.element_count, params, output.mutable_bytes(), output_size);
+      if (output_size == 0) {
+        throw std::runtime_error("MANS compression returned an empty payload. Check dims and input characteristics.");
+      }
+      output.size = output_size;
+      return output;
     }
-    return output;
+
+#ifdef MANS_ENABLE_NV
+    if (options.backend == Backend::kCuda) {
+      return compress_cuda(input, normalized.element_count, params, capacity);
+    }
+#endif
+
+    throw std::runtime_error("Unsupported backend.");
   };
 
   codec.decompress = [](const InputBuffer& input, const CodecOptions& options) -> Buffer {
-    ensure_dcu_backend(options);
-    // The stream header carries the geometry, so only dtype and backend matter here.
-    mans::MansParams params;
-    params.backend = mans::Backend::DCU;
-    params.dtype = options.dtype == DataType::kUInt32 ? mans::DataType::U32 : mans::DataType::U16;
-    params.mode = mans::Mode::P;
+    const auto params = to_mans_params(options);
 
-    const std::size_t raw_bytes = decompressed_bytes(input, params);
-    Buffer output;
-    std::size_t out_size = raw_bytes;
-    if (input.memory_kind == MemoryKind::kDcu) {
-      output = dcu::make_device_buffer(raw_bytes);
-      mans::dcu::decompress_internal_device(input.data, input.size, params, output.mutable_bytes(), out_size);
-    } else {
-      output = make_host_buffer(raw_bytes);
-      mans::dcu::decompress_internal(input.data, input.size, params, output.mutable_bytes(), out_size);
+    if (options.backend == Backend::kDcu) {
+#ifdef PHOTONZIP_ENABLE_DCU
+      return decompress_dcu(input, params);
+#else
+      throw_no_dcu();
+#endif
     }
-    if (out_size != raw_bytes) {
-      throw std::runtime_error("MANS decompression size mismatch.");
+
+    const auto decompressed_bytes = query_decompressed_bytes(input, params);
+
+    if (options.backend == Backend::kCpu) {
+      const void* input_ptr = input.data;
+      Buffer compressed_host;
+#ifdef MANS_ENABLE_NV
+      if (input.memory_kind == MemoryKind::kCuda) {
+        compressed_host = make_host_buffer(input.size);
+        const cudaError_t copy_status = cudaMemcpy(
+            compressed_host.mutable_bytes(), input.data, input.size, cudaMemcpyDeviceToHost);
+        if (copy_status != cudaSuccess) {
+          throw std::runtime_error(std::string("cudaMemcpy D2H failed: ") + cudaGetErrorString(copy_status));
+        }
+        input_ptr = compressed_host.bytes();
+      } else
+#endif
+          if (input.memory_kind != MemoryKind::kHost) {
+        throw std::runtime_error("Unsupported input memory kind.");
+      }
+      Buffer output = make_host_buffer(decompressed_bytes);
+      std::size_t output_size = output.size;
+      mans::decompress(input_ptr, input.size, params, output.mutable_bytes(), output_size);
+      output.size = output_size;
+      return output;
     }
-    output.size = out_size;
-    return output;
+
+#ifdef MANS_ENABLE_NV
+    if (options.backend == Backend::kCuda) {
+      Buffer output = make_cuda_buffer(decompressed_bytes);
+      std::size_t output_size = output.size;
+
+      if (input.memory_kind == MemoryKind::kCuda) {
+        mans::decompress_device(input.data, input.size, params, output.mutable_bytes(), output_size);
+      } else if (input.memory_kind == MemoryKind::kHost) {
+        Buffer compressed_device = make_cuda_buffer(input.size);
+        const cudaError_t copy_status = cudaMemcpy(
+            compressed_device.mutable_bytes(), input.data, input.size, cudaMemcpyHostToDevice);
+        if (copy_status != cudaSuccess) {
+          throw std::runtime_error(std::string("cudaMemcpy H2D failed: ") + cudaGetErrorString(copy_status));
+        }
+        mans::decompress_device(
+            compressed_device.bytes(), input.size, params, output.mutable_bytes(), output_size);
+      } else {
+        throw std::runtime_error("Unsupported input memory kind.");
+      }
+
+      output.size = output_size;
+      return output;
+    }
+#endif
+
+    throw std::runtime_error("Unsupported backend.");
   };
 
-  codec.invoke = nullptr;
+  codec.invoke = &invoke_mans_operation;
+
   return codec;
 }
 

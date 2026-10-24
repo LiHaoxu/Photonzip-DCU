@@ -4,7 +4,8 @@
 
 Checks:
   1. LC: DCU payload is byte-identical to the CPU payload; CPU<->DCU cross decode.
-  2. LC/MANS: host-memory and (if PyTorch sees the DCU) device-memory round trips.
+  2. LC/MANS: host-memory and (if PyTorch sees the DCU) device-memory round trips; MANS P-mode
+     streams cross-decode between the DCU and the MANS CPU backend.
   3. Delta preprocessing: numpy, cpu and dcu backends give the same bytes (both encodings,
      clipped values, 1-D to 4-D), and delta -> MANS/LC -> inverse delta stays on the DCU.
   4. HDF5: H5Z-LC and H5Z-MANS round trips (if h5py is installed and --plugins is given).
@@ -54,9 +55,18 @@ def check_lc(photonzip, name: str, a: np.ndarray) -> None:
 
 
 def check_mans(photonzip, name: str, a: np.ndarray) -> None:
+    import photonzip.codec.mans as mans
+
     packed, t_c = timed(lambda: photonzip.compress(a, codec="mans", backend="dcu"))
     restored, t_d = timed(lambda: np.from_dlpack(photonzip.decompress(packed, backend="dcu")))
     assert np.array_equal(restored.reshape(a.shape), a), f"{name}: MANS mismatch"
+    # P-mode streams are shared with the MANS CPU backend in the same build.
+    p_mode = mans.MansOptions(mode="p", adm_compress_thread=32, adm_decompress_thread=32)
+    cpu = photonzip.compress(a, codec="mans", backend="cpu", codec_options=p_mode)
+    r_dc = np.from_dlpack(photonzip.decompress(packed, backend="cpu"))
+    r_cd = np.from_dlpack(photonzip.decompress(cpu, backend="dcu"))
+    for label, r in (("dcu->cpu", r_dc), ("cpu->dcu", r_cd)):
+        assert np.array_equal(r.reshape(a.shape), a), f"{name}: MANS {label} mismatch"
     print(f"  mans {name:16s} ratio {a.nbytes / packed.nbytes:7.3f}  "
           f"c {a.nbytes / t_c / 1e9:6.2f} GB/s  d {a.nbytes / t_d / 1e9:6.2f} GB/s  OK")
 
@@ -166,9 +176,8 @@ def main() -> int:
 
     import photonzip
 
-    codecs = photonzip.list_codecs()
-    print("codecs:", codecs)
-    if "mans" not in codecs:
+    print("codecs:", photonzip.list_codecs(), "backends:", photonzip.available_backends())
+    if "dcu" not in photonzip.available_backends():
         print("This build has no DCU support (configure with -DPHOTONZIP_ENABLE_DCU=ON).")
         return 1
 
