@@ -18,6 +18,7 @@ sys.path.insert(0, str(PACKAGE_DIR))
 import photonzip
 import photonzip.codec.lc as lc
 import photonzip.codec.mans as mans
+import photonzip.codec.pfpl as pfpl
 
 
 DATASET = REPO_ROOT / "3rdparty/lossless/MANS/testdata/u2/exafel/exafel_59200x388_64kB.u2"
@@ -27,6 +28,11 @@ CPU_DEVICE = int(np.arange(1, dtype=np.uint8).__dlpack_device__()[0])
 
 def _u16():
     return np.fromfile(DATASET, dtype=np.uint16)
+
+
+def _f32():
+    """The uint16 sample scaled into a positive float range PFPL's log quantiser can bin."""
+    return (_u16().astype(np.float32) + 1.0) * 0.5
 
 
 def _roundtrip(x, **kwargs):
@@ -110,6 +116,52 @@ def test_lc_numpy_cpu_3d():
     x = _u16().reshape(16, 16, 128)
     y = _roundtrip(x, codec="lc", codec_options=lc.LcOptions())
     assert y.shape == x.shape and y.tobytes() == x.tobytes()
+
+
+def test_pfpl_registered():
+    assert "pfpl" in photonzip.list_codecs()
+
+
+@pytest.mark.parametrize("shape", [(-1,), (128, 256), (16, 16, 128)])
+def test_pfpl_numpy_cpu_honours_error_bound(shape):
+    error_bound = 1e-3
+    x = _f32().reshape(shape)
+    y = _roundtrip(x, codec="pfpl", codec_options=pfpl.PfplOptions(error_bound=error_bound))
+    assert y.shape == x.shape
+    # PFPL accepts a bin when the reconstruction is within orig * (1 + eb) evaluated in
+    # float32, so the enforced bound can exceed the requested one by about one epsilon.
+    realised = error_bound + 2.0 * float(np.finfo(np.float32).eps)
+    assert np.all(np.abs(y - x) <= realised * np.abs(x))
+
+
+def test_pfpl_tighter_bound_compresses_less():
+    x = _f32()
+    loose = photonzip.compress(x, codec="pfpl", codec_options=pfpl.PfplOptions(error_bound=1e-2))
+    tight = photonzip.compress(x, codec="pfpl", codec_options=pfpl.PfplOptions(error_bound=1e-5))
+    assert len(loose.to_bytes()) < len(tight.to_bytes())
+
+
+def test_pfpl_threshold_keeps_large_samples_exact():
+    x = _f32()
+    threshold = float(np.median(x))
+    y = _roundtrip(
+        x,
+        codec="pfpl",
+        codec_options=pfpl.PfplOptions(error_bound=1e-2, threshold=threshold),
+    )
+    large = x >= threshold
+    assert large.any()
+    assert np.array_equal(y[large], x[large])
+
+
+def test_pfpl_rejects_uint16():
+    with pytest.raises(Exception, match="float32"):
+        photonzip.compress(_u16(), codec="pfpl", codec_options=pfpl.PfplOptions())
+
+
+def test_pfpl_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="Unsupported PFPL mode"):
+        pfpl.PfplOptions(mode="abs").to_codec_params()
 
 
 def test_mans_autotune_smoke():

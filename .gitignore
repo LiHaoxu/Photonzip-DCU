@@ -4,3 +4,4 @@ dist/
 __pycache__/
 .pytest_cache/
 .DS_Store
+plugin_timing.csv

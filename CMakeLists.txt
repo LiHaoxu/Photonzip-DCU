@@ -145,6 +145,7 @@ add_library(photonzip_core STATIC
   src/photonzip/core/codec_registry.cpp
   src/photonzip/codecs/mans/mans_codec.cpp
   src/photonzip/codecs/lc/lc_codec.cpp
+  src/photonzip/codecs/pfpl/pfpl_codec.cpp
   src/photonzip/preprocess/delta_cpu.cpp
 )
 

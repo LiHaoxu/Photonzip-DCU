@@ -6,6 +6,7 @@
 
 #include "photonzip/codecs/lc/lc_codec.hpp"
 #include "photonzip/codecs/mans/mans_codec.hpp"
+#include "photonzip/codecs/pfpl/pfpl_codec.hpp"
 #include "photonzip/core/errors.hpp"
 
 namespace photonzip {
@@ -62,6 +63,7 @@ void register_builtin_codecs() {
   std::call_once(builtin_registration_flag(), []() {
     register_codec(make_mans_codec());
     register_codec(make_lc_codec());
+    register_codec(make_pfpl_codec());
   });
 }
 

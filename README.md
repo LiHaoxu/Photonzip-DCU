@@ -1,16 +1,18 @@
 # 📦 PhotonZip
 
-PhotonZip is a tensor-first Python wrapper around vendored lossless codecs for
-detector and tomography data, on the CPU, NVIDIA GPUs (CUDA) and Hygon DCUs.
+PhotonZip is a tensor-first Python wrapper around vendored lossless and
+error-bounded lossy codecs for detector and tomography data, on the CPU, NVIDIA
+GPUs (CUDA) and Hygon DCUs.
 
 This repository is [hpdps-group/PhotonZip](https://github.com/hpdps-group/PhotonZip)
-plus a DCU backend, the LC codec and global delta preprocessing. Upstream is merged
-as a git remote (`git merge upstream/main`).
+plus a DCU backend, the LC and PFPL codecs, HDF5 filters and global delta
+preprocessing. Upstream is merged as a git remote (`git merge upstream/main`).
 
 | Codec | Data | CPU | CUDA | DCU | HDF5 filter |
 |---|---|---|---|---|---|
 | **MANS** (`codec="mans"`) | uint16/uint32, 1-3D | P- and R-mode, autotuned threads | P- and R-mode | P-mode | `H5Z-MANS` (32032) |
 | **LC** (`codec="lc"`) | uint16 | yes | - | yes | `H5Z-LC` (32771) |
+| **PFPL** (`codec="pfpl"`) | float32, lossy (relative error bound) | yes | - | - | `H5Z-PFPL` (32772) |
 
 **MANS** ([hpdps-group/MANS](https://github.com/hpdps-group/MANS), ADM mapping + ANS)
 
@@ -26,7 +28,13 @@ as a git remote (`git merge upstream/main`).
 - One bitstream for both backends, compatible with the LC framework's standalone
   compressors: compress on the DCU, decompress on the CPU, or the other way round.
 
-Both codecs can be combined with the optional global inter-slice delta
+**PFPL** ([PFPL](https://github.com/burtscher/PFPL) REL pipeline `QREL_4 DIFFNB_4 BIT_4 RZE_1`)
+
+- Error-bounded lossy for float32: every sample is restored within `error_bound`
+  of its own magnitude; samples at or above `threshold` are stored exactly.
+- CPU only. The bitstream matches the standalone PFPL CPU compressor.
+
+The lossless codecs can be combined with the optional global inter-slice delta
 preprocessing (`photonzip.preprocess`), which runs on the CPU or, in DCU builds,
 on the DCU, where its output can stay in device memory for the codec.
 
@@ -35,9 +43,12 @@ a `PhotonZipArray`, which converts to NumPy with `np.from_dlpack(...)`.
 
 > **Status**
 >
-> - CPU + CUDA: built and tested on an RTX 5090 (CUDA 12.8 and, with PyTorch 2.8,
->   12.9): `tests/python/test_codecs.py` passes, and MANS P-mode streams decode across
->   the CPU and CUDA backends.
+> - CPU + CUDA: built on an RTX 5090 host (GCC 11, CUDA 12.8, HDF5 1.10.7) and in the
+>   NGC PyTorch 25.06 container (CUDA 12.9, PyTorch 2.8). `tests/python/test_codecs.py`
+>   passes (MANS CPU/CUDA, LC, PFPL), MANS P-mode streams decode across the CPU and CUDA
+>   backends, and the C++ and h5py HDF5 filter tests pass, except
+>   `test_lc_filter_declines_float32` on HDF5 1.10.7, which keeps a declined optional
+>   filter in the dataset's filter list (the chunks are stored raw and read back).
 > - DCU: tested on a Hygon BW DCU (gfx936, 80 CUs) with DTK 26.04, and with DTK 25.04.1 +
 >   PyTorch 2.5.1 for device tensors. LC payloads from the DCU are byte-identical to the LC
 >   framework's official standalone CPU and GPU compressors, and both official decoders
@@ -51,18 +62,23 @@ a `PhotonZipArray`, which converts to NumPy with `np.from_dlpack(...)`.
 ```
 3rdparty/lossless/lc/      LC framework components (host h_* and device d_*, header-only)
 3rdparty/lossless/MANS/    MANS (CPU, CUDA, DCU backends, H5Z-MANS), vendored, see VENDORED.md
+3rdparty/lossy/pfpl/       PFPL components (host, header-only)
 src/photonzip/core/        codec registry, buffer types, DLPack header, HIP helpers
 src/photonzip/codecs/lc/   LC pipeline (CPU), LC DCU kernels, codec registration
 src/photonzip/codecs/mans/ MANS codec (CPU, CUDA, DCU)
+src/photonzip/codecs/pfpl/ PFPL REL pipeline (CPU) and codec registration
 src/photonzip/preprocess/  inter-slice delta: CPU (OpenMP) and DCU (HIP) kernels
 bindings/python/           pybind11 extension module photonzip._native
 python/photonzip/          Python package (API, codecs, preprocessing)
-filters/                   HDF5 filter plugins H5Z-LC and (DCU builds) H5Z-MANS
+filters/                   HDF5 filter plugins H5Z-LC, H5Z-PFPL, (DCU builds) H5Z-MANS; C++ tests
 examples/photonzip_cli.py  command-line tool with the .pzc container format
 examples/MANS/             MANS examples (autotune, CPU/CUDA round trips, HDF5)
-tests/python/              pytest suite (CPU, CUDA)
+examples/hdf5/             H5Z-LC and H5Z-PFPL round trips with h5py
+tests/python/              pytest suite (codecs on CPU/CUDA, HDF5 filters via h5py)
 tests/test_dcu.py          DCU correctness checks (Python API, device tensors, HDF5)
 benchmarks/dcu_bench.cpp   DCU throughput benchmark (device-resident, host chunks, multi-DCU)
+benchmarks/hdf5/           MPI/HDF5 filter benchmarks (tomography pipeline, PFPL REL sweep)
+scripts/package_source.py  source-only ZIP of the repository
 testdata/u2/               sample uint16 volumes (127^3)
 ```
 
@@ -254,6 +270,17 @@ restored = photonzip.decompress(packed.to_device(), backend="dcu")       # stays
 restored = invert_delta(restored, meta, output_on_dcu=False)              # NumPy array
 ```
 
+PFPL compresses float32 within a relative error bound (CPU only):
+
+```python
+from photonzip.codec.pfpl import PfplOptions
+
+x = np.asarray(..., dtype=np.float32)
+packed = photonzip.compress(x, codec="pfpl", codec_options=PfplOptions(error_bound=1e-3))
+restored = np.from_dlpack(photonzip.decompress(packed))
+# |x - restored| <= ~error_bound * |x|; PfplOptions(threshold=t) keeps |x| >= t exact
+```
+
 `photonzip.compress(...)` defaults to `codec="mans"`. `MansOptions(mode="p"|"r")`
 selects the MANS pipeline (default `"p"`); on the CPU the ADM thread counts come
 from `adm_compress_thread`/`adm_decompress_thread`, a `thread_table`, a
@@ -324,13 +351,23 @@ Building PhotonZip also creates, under `build/bin/plugins/`:
 
 - `libH5Z-MANS.so` (filter ID 32032): the vendored CPU plugin, or the DCU plugin in DCU builds
 - `libH5Z-LC.so` (filter ID 32771)
+- `libH5Z-PFPL.so` (filter ID 32772)
 
 Set `HDF5_PLUGIN_PATH=$PWD/build/bin/plugins` before importing `h5py`.
+Round-trip examples are under `examples/hdf5/`; C++ and h5py correctness tests
+are under `filters/test/` (`build/bin/filters/h5z_*_roundtrip`) and
+`tests/python/test_hdf5_filters.py`. The MPI benchmark and the 32-rank PFPL REL
+sweep are under `benchmarks/hdf5/` (their default data paths point at the RTX 5090
+host they were run on).
 
 `H5Z-LC` takes no `compression_opts`; the decoded size travels in the payload
 header. It accepts uint16 datasets. In DCU builds it runs on the DCU when one is
 present; `PHOTONZIP_LC_BACKEND=cpu|dcu|auto` overrides that. The stored chunks
 are the same either way.
+
+`H5Z-PFPL` accepts float32 datasets; its `compression_opts` come from
+`photonzip.codec.pfpl.to_hdf5_compression_opts(PfplOptions(...))` (mode, error
+bound and threshold as float bits).
 
 `H5Z-MANS` accepts uint16/uint32 datasets and derives the ADM geometry from each
 chunk (last chunk dimension as `nx`, see "MANS geometry"); it stores the geometry in
@@ -460,6 +497,7 @@ bytes          concatenated chunk payloads
 
 ## 🕰️ History
 
+- `2026-10-24`: PFPL REL codec and H5Z-PFPL, HDF5 filter tests, examples and MPI benchmarks.
 - `2026-10-24`: Merged upstream PhotonZip (MANS CPU/CUDA, autotune) with the DCU backend; MANS vendored at hpdps-group/MANS 32793bc.
 - `2026-10-08`: DCU backend (LC and MANS), delta preprocessing, HDF5 filters with DCU support.
 - `2026-04-12`: Add HDF5 Python support for MANS.
@@ -468,5 +506,5 @@ bytes          concatenated chunk payloads
 ## License
 
 BSD 3-Clause (see `LICENSE`). The vendored components under `3rdparty/` carry
-their own notices (`3rdparty/lossless/lc`: BSD 3-Clause; `3rdparty/lossless/MANS`:
-see its `LICENSE`).
+their own notices (`3rdparty/lossless/lc` and `3rdparty/lossy/pfpl`: BSD 3-Clause;
+`3rdparty/lossless/MANS`: see its `LICENSE`).
